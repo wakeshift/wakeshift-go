@@ -25,6 +25,15 @@ type EventsOptions struct {
 	// a personal event's subscriptions need one, and list_subscriptions
 	// lists theirs. Guest sign-in: the TokenInfo's UserID.
 	User func(*auth.TokenInfo) string
+	// Agent, for an app whose users sign in with Wakeshift (accounts:
+	// "wakeshift"), is the signed-in agent behind a request (Exchange its
+	// token): its subscriptions are made with its token, in its person's
+	// workspace, and User is the agent's (Agent.User). A headless app may
+	// set it too (ActAs, for the guest's workspace and agent): a native
+	// subscription to a group's event (EventDef.Group) then lives in that
+	// workspace, beside the agent's memberships, and User is Agent.User;
+	// every other subscription is as without it.
+	Agent func(context.Context, *auth.TokenInfo) (*Agent, error)
 }
 
 // ServeEvents lets every client subscribe to the app's event types (define
@@ -65,14 +74,34 @@ func (a *App) ServeEvents(srv *mcp.Server, opts EventsOptions) func(http.Handler
 		}
 		return opts.User(ti)
 	}
-	a.addEventTools(srv, userOf)
+	// withAgent adds the signed-in agent to a call, for an app whose users
+	// sign in with Wakeshift.
+	withAgent := func(ctx context.Context, ti *auth.TokenInfo, call Call) (Call, error) {
+		if opts.Agent == nil {
+			return call, nil
+		}
+		if ti == nil {
+			return call, errors.New("not signed in")
+		}
+		ag, err := opts.Agent(ctx, ti)
+		if err != nil {
+			return call, err
+		}
+		call.User, call.AgentToken = ag.User(), ag.token
+		return call, nil
+	}
+	a.addEventTools(srv, userOf, withAgent)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
 				next.ServeHTTP(w, r)
 				return
 			}
-			body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+			body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<20))
+			if tooBig := new(http.MaxBytesError); errors.As(err, &tooBig) {
+				http.Error(w, "the request is over 4 MB", http.StatusRequestEntityTooLarge)
+				return
+			}
 			if err != nil {
 				http.Error(w, "can't read the request", http.StatusBadRequest)
 				return
@@ -119,6 +148,9 @@ func (a *App) ServeEvents(srv *mcp.Server, opts EventsOptions) func(http.Handler
 			if info, ok := p.Meta["io.modelcontextprotocol/clientInfo"].(map[string]any); ok {
 				call.Client, _ = info["name"].(string)
 			}
+			if call, err = withAgent(r.Context(), auth.TokenInfoFromContext(r.Context()), call); err != nil {
+				call.User = "" // refused below, as a caller with no user is
+			}
 			dialect := event.DialectOf(call.Client, call.UserAgent)
 			codes := event.CodesFor(dialect)
 			if h := r.Header.Get(event.NameHeader); h != "" {
@@ -157,6 +189,15 @@ func (a *App) ServeEvents(srv *mcp.Server, opts EventsOptions) func(http.Handler
 					rpcError(w, req.ID, codes.Forbidden, fill("native_refused", "{event}", t.name), nil)
 					return
 				}
+			}
+			if req.Method == "events/subscribe" && t.group != nil {
+				args, _ := json.Marshal(p.Arguments)
+				g, gerr := t.group(r.Context(), Subscriber{User: call.User, Client: call.Client, Native: true}, args)
+				if gerr != nil || g == "" {
+					rpcError(w, req.ID, codes.Forbidden, fill("native_refused", "{event}", t.name), nil)
+					return
+				}
+				p.group = g
 			}
 			out, err := a.eventCall(r.Context(), req.Method, call, dialect, p)
 			if err != nil {
@@ -236,6 +277,8 @@ type eventParams struct {
 	Cursor   *string        `json:"cursor"`
 	MaxAgeMs *int64         `json:"maxAgeMs"`
 	Meta     map[string]any `json:"_meta"`
+	// group is a group's event's group (EventDef.Group), for Wakeshift.
+	group string
 }
 
 // errNoSubscription is an events/unsubscribe that matched nothing.
@@ -265,6 +308,9 @@ func (a *App) eventCall(ctx context.Context, method string, call Call, dialect s
 	}
 	if p.MaxAgeMs != nil {
 		body["max_age_ms"] = *p.MaxAgeMs
+	}
+	if p.group != "" {
+		body["group"] = p.group
 	}
 	var out struct {
 		ID             string          `json:"id"`
@@ -389,4 +435,22 @@ func addEventsCapability(b []byte) []byte {
 		return b
 	}
 	return out
+}
+
+// SpeaksEvents reports whether a tool call comes from a client that
+// subscribes to the app's event types itself, with MCP Events (ChatGPT),
+// rather than through subscribe_events: a tool that wants the caller woken
+// (a game's join) tells such a client which event to subscribe to.
+func SpeaksEvents(req *mcp.CallToolRequest) bool {
+	if req == nil {
+		return false
+	}
+	var client, ua string
+	if info := req.ClientInfo(); info != nil {
+		client = info.Name
+	}
+	if req.Extra != nil && req.Extra.Header != nil {
+		ua = req.Extra.Header.Get("User-Agent")
+	}
+	return event.DialectOf(client, ua) == event.DialectChatGPT
 }

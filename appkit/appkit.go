@@ -2,7 +2,7 @@
 // Sources, and anyone else's).
 //
 // An app has an ID and an Ed25519 key registered with Wakeshift (an app key
-// from the console, wst_test_…, carries both: see FromKey). With them it:
+// from the console, wst_…; Open finds the app it belongs to). With them it:
 //   - publishes its manifest (what it may do) and proves who it is with
 //     short-lived signed assertions;
 //   - runs its own MCP server whose clients sign in with Wakeshift: appkit
@@ -17,7 +17,7 @@
 // (@wakeshift/sdk), with one name that differs: Annotate returns the
 // Addition, as the SDK's addition(call) does (the SDK's annotate(call,
 // result) also applies it; here that's Addition.Apply). Unlike the SDK,
-// FromKey reads no WAKESHIFT_CORE and has no default core; nothing warns
+// only Open reads WAKESHIFT_CORE and defaults to DefaultCore; nothing warns
 // when Wakeshift recognised no harness in a call (read Addition.Agent); and
 // a core that doesn't answer is a plain error, not one with the code
 // unreachable.
@@ -55,7 +55,8 @@ type App struct {
 	fetchMu   sync.Mutex
 	jwks      map[string]ed25519.PublicKey
 	jwksAt    time.Time         // last successful fetch
-	jwksTried time.Time         // last attempt
+	jwksNext  time.Time         // the soonest the next fetch may run
+	jwksFail  bool              // the last fetch failed
 	exchanged map[string]*Agent // by the agent's token
 
 	eventTypes []*eventType // DefineEvent's, in order
@@ -93,13 +94,20 @@ func (a *App) client() *http.Client {
 	return defaultClient
 }
 
-// assertion signs a fresh, short-lived assertion of the app's identity.
+// assertion signs a fresh, short-lived assertion of the app's identity,
+// naming the key by its kid. iss and sub are the app's ID, or the kid
+// while the ID isn't known yet (Open asking which app the key is).
 func (a *App) assertion() (string, error) {
 	jti := make([]byte, 16)
 	rand.Read(jti)
 	now := time.Now()
-	return jws.Sign(a.Key, "", "app+jwt", map[string]any{
-		"iss": a.ID, "sub": a.ID, "aud": a.core() + "/api/apps",
+	kid := a.kid()
+	iss := a.ID
+	if iss == "" {
+		iss = kid
+	}
+	return jws.Sign(a.Key, kid, "app+jwt", map[string]any{
+		"iss": iss, "sub": iss, "aud": a.core() + "/api/apps",
 		"iat": now.Unix(), "exp": now.Add(2 * time.Minute).Unix(), "jti": base64.RawURLEncoding.EncodeToString(jti),
 	})
 }
@@ -128,7 +136,7 @@ func (a *App) callWith(ctx context.Context, client *http.Client, method, path, b
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := client.Do(req)
+	resp, err := a.do(client, req)
 	if err != nil {
 		return err
 	}
@@ -302,13 +310,25 @@ type GroupMember struct {
 	Connected *bool `json:"connected,omitempty"`
 }
 
-// GroupPost is something the app posts to a group as itself.
+// GroupPost is something the app posts to a group: as itself, or (Sender)
+// for one of its own people.
 type GroupPost struct {
 	Subject  string   `json:"subject"`
 	Body     string   `json:"body,omitempty"`
 	Data     any      `json:"data,omitempty"`
 	Mentions []string `json:"mentions,omitempty"` // group handles
 	ParentID string   `json:"parent_id,omitempty"`
+	// Sender, for a headless app's own person (posting from its site): the
+	// post is from {kind: "person", id: handle}, never a member's kind, and
+	// refused (handle_taken) if a member has the handle. It reaches every
+	// member as outside input.
+	Sender *Sender `json:"sender,omitempty"`
+}
+
+// Sender is a person the app posts for: their handle (lowercase letters,
+// digits and dashes, up to 24 characters, starting with a letter).
+type Sender struct {
+	Handle string `json:"handle"`
 }
 
 func groupPath(typ string) string { return "/api/apps/v1/groups/" + url.PathEscape(typ) }
@@ -363,13 +383,25 @@ func (a *App) ResourceMetadata(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// Challenge answers an unauthenticated MCP request: 401 with a pointer to the
-// resource metadata.
-func (a *App) Challenge(w http.ResponseWriter) {
+// Challenge answers an MCP request that sent no bearer token: 401 with a
+// pointer to the resource metadata. For a request whose token was refused,
+// use RefuseToken (or let RequireBearer choose).
+func (a *App) Challenge(w http.ResponseWriter) { challenge(w, a.metadataURL(), nil) }
+
+// RefuseToken answers an MCP request whose bearer token failed verification
+// (err is why, e.g. from Verify): Challenge's 401, adding
+// error="invalid_token" (RFC 6750 3.1), which tells clients to refresh
+// rather than sign in again.
+func (a *App) RefuseToken(w http.ResponseWriter, err error) {
+	if err == nil {
+		err = &TokenError{Reason: ReasonInvalid}
+	}
+	challenge(w, a.metadataURL(), err)
+}
+
+func (a *App) metadataURL() string {
 	u, _ := url.Parse(a.MCPURL)
-	meta := u.Scheme + "://" + u.Host + "/.well-known/oauth-protected-resource"
-	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata=%q`, meta))
-	http.Error(w, "sign in with Wakeshift", http.StatusUnauthorized)
+	return u.Scheme + "://" + u.Host + "/.well-known/oauth-protected-resource"
 }
 
 // Claims are a verified access token's claims.
@@ -384,56 +416,88 @@ type Claims struct {
 }
 
 // Verify checks an access token an MCP client sent: signed by Wakeshift
-// (keys from its JWKS), issued for this app's MCP URL, not expired.
+// (keys from its JWKS), issued for this app's MCP URL, not expired. A
+// refused token's error is a *TokenError saying why.
 func (a *App) Verify(ctx context.Context, token string) (Claims, error) {
 	var c Claims
-	_, err := jws.Verify(token, "at+jwt", func(h jws.Header) ed25519.PublicKey { return a.key(ctx, h.Kid) }, &c)
+	reason := ReasonInvalid
+	_, err := jws.Verify(token, "at+jwt", func(h jws.Header) ed25519.PublicKey {
+		k, checked := a.key(ctx, h.Kid)
+		switch {
+		case k == nil && checked:
+			reason = ReasonUnknownKey
+		case k == nil:
+			reason = ReasonKeysUnavailable
+		}
+		return k
+	}, &c)
+	now := time.Now()
 	switch {
 	case err != nil:
-		return c, errors.New("invalid token")
+		return c, &TokenError{Reason: reason}
 	case c.Issuer != a.core():
-		return c, errors.New("token from another issuer")
+		return c, &TokenError{Reason: ReasonIssuer}
 	case c.Audience != a.MCPURL:
-		return c, errors.New("token for another app")
-	case time.Now().Unix() >= c.Expires:
-		return c, errors.New("token expired")
+		return c, &TokenError{Reason: ReasonAudience}
+	case now.Unix() >= c.Expires:
+		return c, &TokenError{Reason: ReasonExpired, Past: now.Sub(time.Unix(c.Expires, 0))}
 	}
 	return c, nil
 }
 
+// JWKS fetches: known keys are refetched once older than jwksMaxAge. An
+// unknown kid fetches at most every jwksRefetch after a fetch that worked
+// (Wakeshift publishes a key 10 minutes before it signs with it, so a kid
+// missing from a fresh JWKS isn't Wakeshift's), and jwksRetry after one
+// that failed, so one failure (say, a fresh instance's first fetch after a
+// deploy) doesn't refuse every token for a minute.
+const (
+	jwksMaxAge  = time.Hour
+	jwksRefetch = time.Minute
+	jwksRetry   = 5 * time.Second
+	jwksTimeout = 10 * time.Second
+)
+
 // key returns a Wakeshift signing key, fetching the JWKS when it's unknown
-// or stale, at most once a minute. A failed fetch keeps the keys it had.
-// The fetch runs outside a.mu (which the exchange cache shares).
-func (a *App) key(ctx context.Context, kid string) ed25519.PublicKey {
+// or stale. A failed fetch keeps the keys it had. checked reports whether
+// the keys looked in came from a fetch that worked, the last one tried: a
+// nil key with checked is a kid Wakeshift doesn't publish. The fetch runs
+// outside a.mu (which the exchange cache shares), and the request's
+// cancellation doesn't cut it short (that would count as a failed fetch).
+func (a *App) key(ctx context.Context, kid string) (k ed25519.PublicKey, checked bool) {
 	a.mu.Lock()
 	k, ok := a.jwks[kid]
-	fresh, tried := time.Since(a.jwksAt) < time.Hour, time.Since(a.jwksTried) < time.Minute
+	fresh, wait := time.Since(a.jwksAt) < jwksMaxAge, time.Now().Before(a.jwksNext)
+	checked = a.jwks != nil && !a.jwksFail
 	a.mu.Unlock()
-	if ok && fresh || tried {
-		return k
+	if ok && fresh || wait {
+		return k, checked
 	}
 	a.fetchMu.Lock() // one fetch at a time; the others wait for its result
 	defer a.fetchMu.Unlock()
 	a.mu.Lock()
-	if time.Since(a.jwksTried) < time.Minute {
-		k := a.jwks[kid]
-		a.mu.Unlock()
-		return k
+	if time.Now().Before(a.jwksNext) { // another fetch ran meanwhile
+		defer a.mu.Unlock()
+		return a.jwks[kid], a.jwks != nil && !a.jwksFail
 	}
-	a.jwksTried = time.Now()
 	a.mu.Unlock()
-	keys, err := a.fetchJWKS(ctx)
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jwksTimeout)
+	keys, err := a.fetchJWKS(fctx)
+	cancel()
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	now := time.Now()
 	if err == nil && len(keys) > 0 {
-		a.jwks, a.jwksAt = keys, time.Now()
+		a.jwks, a.jwksAt, a.jwksFail, a.jwksNext = keys, now, false, now.Add(jwksRefetch)
+	} else {
+		a.jwksFail, a.jwksNext = true, now.Add(jwksRetry)
 	}
-	return a.jwks[kid]
+	return a.jwks[kid], a.jwks != nil && !a.jwksFail
 }
 
 func (a *App) fetchJWKS(ctx context.Context) (map[string]ed25519.PublicKey, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", a.core()+"/oauth/jwks", nil)
-	resp, err := a.client().Do(req)
+	resp, err := a.do(a.client(), req)
 	if err != nil {
 		return nil, err
 	}
@@ -457,7 +521,7 @@ func (a *App) fetchJWKS(ctx context.Context) (map[string]ed25519.PublicKey, erro
 }
 
 // ParseKey reads an app's Ed25519 private key: an app key from the console
-// (wst_test_…, see ParseAppKey), or base64 (standard or URL) of a 32-byte
+// (wst_…, either format, see ParseAppKey), or base64 (standard or URL) of a 32-byte
 // seed or a 64-byte key.
 func ParseKey(s string) (ed25519.PrivateKey, error) {
 	if strings.HasPrefix(strings.TrimSpace(s), keyPrefix) {

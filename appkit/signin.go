@@ -73,7 +73,7 @@ func (a *App) tokens(ctx context.Context, form url.Values) (SignedIn, error) {
 	form.Set("client_assertion", assertion)
 	req, _ := http.NewRequestWithContext(ctx, "POST", a.core()+"/oauth/token", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := a.client().Do(req)
+	resp, err := a.do(a.client(), req)
 	if err != nil {
 		return SignedIn{}, err
 	}

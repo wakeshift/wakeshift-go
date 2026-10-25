@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -63,6 +64,25 @@ type EventDef[A, P any] struct {
 	// names the subscriber: Wakeshift takes it from the subscriber's own
 	// sign-in.
 	Personal bool
+	// DeleteOnDelivery: Wakeshift deletes an occurrence's content (its
+	// text and payload) once it's delivered to the agent, keeping only what
+	// it needs to show that it happened (IDs, times, where it went). For
+	// messages people wouldn't expect a third party to keep, such as chat
+	// messages. One that isn't delivered expires as any other does. An
+	// agent can't have it again after delivery: a replay skips it.
+	DeleteOnDelivery bool
+	// Group makes the event a group's posts (docs/delivery-destinations.md):
+	// it names the app's group (its type, app.<app>.…) that a subscription
+	// with these arguments is for. A client that subscribes natively (MCP
+	// Events) then gets the posts its agent's membership of that group
+	// would wake it for, by its webhook, in place of its conversation:
+	// joining stays the app's (Agent.SubscribeAs), and Wakeshift refuses
+	// the subscription unless the agent is a member. The payload is
+	// Wakeshift's (P is GroupMessage), there's no Emit or PublishURL (posts
+	// come from the group), Text isn't needed, and subscribe_events refuses
+	// it: a bridged conversation's membership already wakes it. An error
+	// refuses the subscription, as Authorize does.
+	Group func(ctx context.Context, s Subscriber, args A) (string, error)
 
 	// ArgsSchema and PayloadSchema, if set, are the JSON Schemas used
 	// instead of A's and P's.
@@ -75,6 +95,61 @@ type EventDef[A, P any] struct {
 	// optional argument with the same name.
 	Topic  string
 	Filter map[string]string
+}
+
+// withArguments is a group's event's payload schema: GroupMessage's, with
+// the arguments' properties (and which are required) added, as Wakeshift
+// sends them; GroupMessage's own win a clash.
+func withArguments(payload, args json.RawMessage) (json.RawMessage, error) {
+	type schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	var p, a map[string]json.RawMessage
+	var ps, as schema
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(payload, &ps); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(args, &as); err != nil {
+		return nil, err
+	}
+	if ps.Properties == nil {
+		ps.Properties = map[string]json.RawMessage{}
+	}
+	for k, v := range as.Properties {
+		if _, clash := ps.Properties[k]; !clash {
+			ps.Properties[k] = v
+			if slices.Contains(as.Required, k) {
+				ps.Required = append(ps.Required, k)
+			}
+		}
+	}
+	var err error
+	if p["properties"], err = json.Marshal(ps.Properties); err != nil {
+		return nil, err
+	}
+	if p["required"], err = json.Marshal(ps.Required); err != nil {
+		return nil, err
+	}
+	return json.Marshal(p)
+}
+
+// GroupMessage is a group's post, as a group's event (EventDef.Group)
+// carries it to one member, after the subscription's arguments.
+type GroupMessage struct {
+	ID        string         `json:"id" jsonschema:"The message's ID: reply to it with the app's tools"`
+	From      string         `json:"from,omitempty" jsonschema:"Who posted it: their handle in the group; empty for the app itself"`
+	Subject   string         `json:"subject" jsonschema:"A one-line summary"`
+	Text      string         `json:"text,omitempty" jsonschema:"The message in full"`
+	Mentioned bool           `json:"mentioned" jsonschema:"Whether it @-mentions you"`
+	ReplyTo   string         `json:"reply_to,omitempty" jsonschema:"The message it replies to"`
+	Data      map[string]any `json:"data,omitempty" jsonschema:"The app's own data about the message"`
 }
 
 // Subscriber is who's subscribing: what Authorize decides on.
@@ -103,8 +178,11 @@ type eventType struct {
 	topic                    string
 	filter                   map[string]string
 	personal                 bool
+	deleteOnDelivery         bool
 	argNames                 []string // in name order
 	authorize                func(ctx context.Context, s Subscriber, args json.RawMessage) bool
+	// group is EventDef.Group's: nil for any other event.
+	group func(ctx context.Context, s Subscriber, args json.RawMessage) (string, error)
 }
 
 var (
@@ -124,8 +202,12 @@ func DefineEvent[A, P any](app *App, name string, def EventDef[A, P]) (*DefinedE
 		return nil, errors.New("appkit: event names starting with wakeshift. are Wakeshift's")
 	case strings.TrimSpace(def.Description) == "":
 		return nil, fmt.Errorf("appkit: event %s needs a Description", name)
-	case def.Text == nil:
+	case def.Text == nil && def.Group == nil:
 		return nil, fmt.Errorf("appkit: event %s needs Text", name)
+	case def.Group != nil && reflect.TypeFor[P]() != reflect.TypeFor[GroupMessage]():
+		return nil, fmt.Errorf("appkit: event %s is a group's posts: its payload is GroupMessage", name)
+	case def.Group != nil && (def.Personal || def.DeleteOnDelivery || len(def.Filter) > 0):
+		return nil, fmt.Errorf("appkit: event %s is a group's posts: it can't be Personal, DeleteOnDelivery or have a Filter (the membership's wake filters it)", name)
 	}
 	args, err := schemaFor[A](def.ArgsSchema)
 	if err != nil {
@@ -135,8 +217,15 @@ func DefineEvent[A, P any](app *App, name string, def EventDef[A, P]) (*DefinedE
 	if err != nil {
 		return nil, fmt.Errorf("appkit: event %s: payload: %w", name, err)
 	}
+	if def.Group != nil {
+		// Each post comes with the subscription's arguments too, so it
+		// says which group it's from as the app names it ({"game": …}).
+		if payload, err = withArguments(payload, args); err != nil {
+			return nil, fmt.Errorf("appkit: event %s: payload: %w", name, err)
+		}
+	}
 	t := &eventType{name: name, title: def.Title, description: def.Description, args: args, payload: payload,
-		topic: def.Topic, filter: def.Filter, personal: def.Personal}
+		topic: def.Topic, filter: def.Filter, personal: def.Personal, deleteOnDelivery: def.DeleteOnDelivery}
 	var props schemaProps
 	json.Unmarshal(args, &props)
 	for n := range props.Properties {
@@ -149,6 +238,23 @@ func DefineEvent[A, P any](app *App, name string, def EventDef[A, P]) (*DefinedE
 		}
 	} else if err := checkRoute(t.topic, t.filter, args, payload); err != nil {
 		return nil, fmt.Errorf("appkit: event %s: %w", name, err)
+	}
+	if def.Group != nil {
+		t.group = func(ctx context.Context, s Subscriber, raw json.RawMessage) (group string, err error) {
+			var a A
+			if len(raw) > 0 {
+				if err := json.Unmarshal(raw, &a); err != nil {
+					return "", err
+				}
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Warn("appkit: Group panicked, so the subscription was refused", "event", name, "panic", fmt.Sprint(r))
+					group, err = "", errors.New("appkit: Group panicked")
+				}
+			}()
+			return def.Group(ctx, s, a)
+		}
 	}
 	if def.Authorize != nil {
 		t.authorize = func(ctx context.Context, s Subscriber, raw json.RawMessage) (ok bool) {
@@ -199,6 +305,73 @@ type Emitted struct {
 	Duplicate bool `json:"duplicate"` // an earlier Emit had this ID
 }
 
+// CallerSubscription is a subscription made for the conversation calling an
+// app's tool (Subscribe).
+type CallerSubscription struct {
+	ID      string `json:"id"`
+	Created bool   `json:"created"` // false: it had one already, now renewed
+	// Session is the conversation's session key.
+	Session string `json:"session"`
+	// Addition is what the tool's result needs so the conversation is
+	// woken (Apply it to the result), as subscribe_events' result has.
+	Addition Addition `json:"addition"`
+}
+
+// Subscribe subscribes the conversation calling your tool (call: built from
+// the tool's request, Args.Call) to this event with args, the way
+// subscribe_events would, so a tool like a game's join sets up its own
+// wakes in one step. It's for clients Wakeshift wakes: a client that speaks
+// MCP Events (SpeaksEvents) subscribes itself. Your tool decides who may:
+// Authorize isn't consulted here. A personal event needs call.User, who the
+// subscription belongs to. It's the TypeScript SDK's event.subscribe.
+func (e *DefinedEvent[A, P]) Subscribe(ctx context.Context, call Call, args A) (CallerSubscription, error) {
+	if e.t.group != nil {
+		return CallerSubscription{}, fmt.Errorf("appkit: %s is a group's posts: a conversation's membership of the group wakes it", e.t.name)
+	}
+	if e.t.personal && strings.TrimSpace(call.User) == "" {
+		return CallerSubscription{}, fmt.Errorf("appkit: %s is personal: Subscribe needs call.User, who the subscription belongs to", e.t.name)
+	}
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		return CallerSubscription{}, fmt.Errorf("appkit: %s: encoding the arguments: %w", e.t.name, err)
+	}
+	var out struct {
+		EventSubscription struct {
+			ID      string `json:"id"`
+			Created bool   `json:"created"`
+		} `json:"event_subscription"`
+		Session  string   `json:"session"`
+		Addition Addition `json:"addition"`
+	}
+	if err := e.app.appCall(ctx, "POST", "/api/apps/v1/event-subscriptions",
+		map[string]any{"call": call, "name": e.t.name, "arguments": e.t.knownJSON(argsJSON)}, &out); err != nil {
+		return CallerSubscription{}, err
+	}
+	return CallerSubscription{ID: out.EventSubscription.ID, Created: out.EventSubscription.Created, Session: out.Session, Addition: out.Addition}, nil
+}
+
+// Unsubscribe ends the calling conversation's subscription to this event
+// with args (call: as for Subscribe), reporting whether it had one.
+func (e *DefinedEvent[A, P]) Unsubscribe(ctx context.Context, call Call, args A) (bool, error) {
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		return false, fmt.Errorf("appkit: %s: encoding the arguments: %w", e.t.name, err)
+	}
+	var out struct {
+		Ended bool `json:"ended"`
+	}
+	err = e.app.appCall(ctx, "POST", "/api/apps/v1/event-subscriptions/unsubscribe",
+		map[string]any{"call": call, "name": e.t.name, "arguments": e.t.knownJSON(argsJSON)}, &out)
+	return out.Ended, err
+}
+
+// End ends one of user's subscriptions to the app's events by its ID (from
+// Subscribe or EventSubscriptions), wherever it delivers, reporting whether
+// one ended. It's App.EndEventSubscription.
+func (e *DefinedEvent[A, P]) End(ctx context.Context, user, id string) (bool, error) {
+	return e.app.EndEventSubscription(ctx, user, id)
+}
+
 // Emit sends one occurrence: to everyone subscribed with arguments that
 // match args (a personal event: to one user's subscriptions, To). The
 // payload is checked against the event's schema.
@@ -208,6 +381,8 @@ func (e *DefinedEvent[A, P]) Emit(ctx context.Context, args A, payload P, opts .
 		f(&o)
 	}
 	switch {
+	case e.t.group != nil:
+		return Emitted{}, fmt.Errorf("appkit: %s is a group's posts: post to the group", e.t.name)
 	case e.t.personal && strings.TrimSpace(o.to) == "":
 		return Emitted{}, fmt.Errorf("appkit: %s is personal: Emit needs To(user)", e.t.name)
 	case !e.t.personal && o.to != "":
@@ -234,6 +409,38 @@ func (e *DefinedEvent[A, P]) Emit(ctx context.Context, args A, payload P, opts .
 	return out, err
 }
 
+// PublishURL makes a publish URL for this event with args (a personal
+// event: To, the one user it's for), for services that can only send
+// webhooks. A POST's body, a JSON object, is an occurrence's payload,
+// checked against the event's schema; the agent reads the event's name and
+// the start of the payload, since Text doesn't run. Anyone with the URL
+// can emit until App.RevokePublishURL.
+func (e *DefinedEvent[A, P]) PublishURL(ctx context.Context, args A, opts ...EmitOption) (PublishURL, error) {
+	var o emitOptions
+	for _, f := range opts {
+		f(&o)
+	}
+	switch {
+	case e.t.group != nil:
+		return PublishURL{}, fmt.Errorf("appkit: %s is a group's posts: post to the group", e.t.name)
+	case e.t.personal && strings.TrimSpace(o.to) == "":
+		return PublishURL{}, fmt.Errorf("appkit: %s is personal: PublishURL needs To(user)", e.t.name)
+	case !e.t.personal && o.to != "":
+		return PublishURL{}, fmt.Errorf("appkit: %s isn't personal: To is only for personal events", e.t.name)
+	}
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		return PublishURL{}, fmt.Errorf("appkit: %s: encoding the arguments: %w", e.t.name, err)
+	}
+	body := map[string]any{"name": e.t.name, "arguments": json.RawMessage(argsJSON)}
+	if o.to != "" {
+		body["to"] = o.to
+	}
+	var out PublishURL
+	err = e.app.appCall(ctx, "POST", "/api/apps/v1/events/publish-urls", body, &out)
+	return out, err
+}
+
 // definition is the event type as events/list describes it.
 func (t *eventType) definition() map[string]any {
 	d := map[string]any{"name": t.name, "description": t.description, "delivery": []string{"webhook"},
@@ -247,7 +454,7 @@ func (t *eventType) definition() map[string]any {
 // manifestEntry is the event type as the manifest carries it.
 func (t *eventType) manifestEntry() ManifestEvent {
 	return ManifestEvent{Name: t.name, Description: t.description, Arguments: t.args, Payload: t.payload, Topic: t.topic,
-		Filter: t.filter, Personal: t.personal}
+		Filter: t.filter, Personal: t.personal, DeleteOnDelivery: t.deleteOnDelivery, Group: t.group != nil}
 }
 
 // ManifestEvent is an event type in the manifest (see the core's
@@ -260,6 +467,10 @@ type ManifestEvent struct {
 	Topic       string            `json:"topic"`
 	Filter      map[string]string `json:"filter,omitempty"`
 	Personal    bool              `json:"personal,omitempty"`
+	// DeleteOnDelivery: EventDef.DeleteOnDelivery.
+	DeleteOnDelivery bool `json:"delete_on_delivery,omitempty"`
+	// Group: EventDef.Group is set.
+	Group bool `json:"group,omitempty"`
 }
 
 // events is the app's event types, in the order they were defined.

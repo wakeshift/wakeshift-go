@@ -8,7 +8,6 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -48,7 +47,11 @@ type GuestAuth struct {
 	// Base is the app's public URL (default: its MCP URL without /mcp).
 	Base string
 	// AccessTTL (default an hour) and RefreshTTL (default 30 days). Each
-	// refresh returns a new refresh token, good for RefreshTTL from then.
+	// refresh returns a new refresh token, good for RefreshTTL from then;
+	// the one it replaced also stays good until it expires (nothing is
+	// stored to record that it was used). Every refresh needs the client's
+	// secret too, and Revoked, ForgetUser or revoking the grant cut a guest
+	// off whatever refresh tokens it holds.
 	AccessTTL, RefreshTTL time.Duration
 	// Revoked, if set, is asked at each refresh whether the guest's refresh
 	// token issued at issuedAt is revoked: an app's own denylist, or a
@@ -230,8 +233,8 @@ func (g *GuestAuth) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, u := range in.RedirectURIs {
-		if p, err := url.Parse(u); err != nil || p.Scheme == "" || len(u) > 500 {
-			oauthErr(w, http.StatusBadRequest, "invalid_redirect_uri", "bad redirect URI")
+		if len(u) > 500 || !validRedirect(u) {
+			oauthErr(w, http.StatusBadRequest, "invalid_redirect_uri", badRedirect)
 			return
 		}
 	}
@@ -279,7 +282,10 @@ func (g *GuestAuth) authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if q.Get("response_type") != "code" || !pkceRE.MatchString(q.Get("code_challenge")) || q.Get("code_challenge_method") != "S256" {
-		redirectErr(w, r, redirect, q.Get("state"), "invalid_request", "PKCE (S256) is required")
+		// Said here, not by redirecting: anyone can register a client with
+		// any https redirect, and there's no step for the person first, so
+		// redirecting a bad request would make this an open redirect.
+		http.Error(w, "This sign-in request is incomplete: PKCE (S256) and response_type=code are required.", http.StatusBadRequest)
 		return
 	}
 	p := pending{Client: q.Get("client_id"), Redirect: redirect, State: q.Get("state"), Challenge: q.Get("code_challenge"),
@@ -348,6 +354,10 @@ func (g *GuestAuth) token(w http.ResponseWriter, r *http.Request) {
 			oauthErr(w, http.StatusForbidden, "access_denied", "this app can't take more guests right now")
 			return
 		}
+		if IsCode(err, "workspace_rate_limited") {
+			oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "this app is taking too many new guests right now; try again later")
+			return
+		}
 		if err != nil {
 			slog.Error("appkit: making a guest", "err", err)
 			oauthErr(w, http.StatusServiceUnavailable, "temporarily_unavailable", "couldn't sign in; try again")
@@ -389,11 +399,15 @@ func (g *GuestAuth) token(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"access_token": access, "token_type": "Bearer", "expires_in": int(g.accessTTL().Seconds()), "refresh_token": refresh})
 }
 
-// Verify checks a guest access token from an MCP request.
+// Verify checks a guest access token from an MCP request. A refused token's
+// error is a *TokenError saying why.
 func (g *GuestAuth) Verify(token string) (Guest, error) {
 	var t guestToken
-	if !g.open("access", token, &t) || time.Now().Unix() > t.Expires {
-		return Guest{}, errors.New("appkit: invalid or expired guest token")
+	if !g.open("access", token, &t) {
+		return Guest{}, &TokenError{Reason: ReasonInvalid}
+	}
+	if now := time.Now(); now.Unix() >= t.Expires {
+		return Guest{}, &TokenError{Reason: ReasonExpired, Past: now.Sub(time.Unix(t.Expires, 0))}
 	}
 	return Guest{Workspace: t.Workspace, Agent: t.Agent, Client: t.Client, Expires: time.Unix(t.Expires, 0)}, nil
 }
@@ -534,18 +548,27 @@ func oauthErr(w http.ResponseWriter, status int, code, desc string) {
 	writeJSON(w, status, map[string]string{"error": code, "error_description": desc})
 }
 
-func redirectErr(w http.ResponseWriter, r *http.Request, redirect, state, code, desc string) {
-	u, err := url.Parse(redirect)
-	if err != nil {
-		http.Error(w, desc, http.StatusBadRequest)
-		return
+const badRedirect = "redirect URIs are https, http on loopback (localhost, 127.0.0.1, [::1]) or a private-use scheme (cursor://…), without a fragment"
+
+var redirectSchemeRE = regexp.MustCompile(`^[a-z][a-z0-9+.-]*$`)
+
+// validRedirect accepts https URLs, http on loopback (native apps, RFC
+// 8252) and private-use schemes (cursor://…), never ones a browser would
+// run or that carry a fragment, as the core's OAuth does.
+func validRedirect(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Fragment != "" || !redirectSchemeRE.MatchString(u.Scheme) {
+		return false
 	}
-	v := u.Query()
-	v.Set("error", code)
-	v.Set("error_description", desc)
-	if state != "" {
-		v.Set("state", state)
+	switch u.Scheme {
+	case "https":
+		return u.Host != ""
+	case "http":
+		h := u.Hostname()
+		ip := net.ParseIP(h)
+		return h == "localhost" || ip != nil && ip.IsLoopback()
+	case "javascript", "data", "file", "blob", "about", "vbscript":
+		return false
 	}
-	u.RawQuery = v.Encode()
-	http.Redirect(w, r, u.String(), http.StatusFound)
+	return true
 }

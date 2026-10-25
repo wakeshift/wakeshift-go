@@ -20,6 +20,20 @@ type Agent struct {
 	ID        string
 }
 
+// User is the agent as a personal event's subscriber, for an app whose
+// users sign in with Wakeshift: its workspace and ID ("<workspace>/<id>").
+// Emit to it with To(ag.User()).
+func (ag *Agent) User() string { return ag.Workspace + "/" + ag.ID }
+
+// Call is the agent's conversation in session (its handle, e.g.
+// claude-code#2) as an app whose users sign in with Wakeshift passes it to
+// DefinedEvent.Subscribe and Unsubscribe: the subscription is the agent's,
+// in its person's workspace, under the consent they gave (Wakeshift checks
+// the token, and refuses once the consent is revoked).
+func (ag *Agent) Call(session string) Call {
+	return Call{User: ag.User(), Session: session, AgentToken: ag.token}
+}
+
 // Exchange turns the access token an agent sent the app into an Agent the
 // app can act for. Results are cached until shortly before they expire
 // (up to 15 minutes), so a revoked consent shows up as the Agent's calls
@@ -49,7 +63,7 @@ func (a *App) Exchange(ctx context.Context, agentToken string) (*Agent, error) {
 	}
 	req, _ := http.NewRequestWithContext(ctx, "POST", a.core()+"/oauth/token", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := a.client().Do(req)
+	resp, err := a.do(a.client(), req)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +80,15 @@ func (a *App) Exchange(ctx context.Context, agentToken string) (*Agent, error) {
 	}
 	ag := &Agent{app: a, token: out.AccessToken, expires: time.Now().Add(time.Duration(out.ExpiresIn) * time.Second),
 		Workspace: claims.Workspace, ID: claims.Agent}
+	a.cacheAgent(agentToken, ag)
+	return ag, nil
+}
+
+// cacheAgent keeps ag under key in the cache of exchanged tokens, dropping
+// the ones that have expired.
+func (a *App) cacheAgent(key string, ag *Agent) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.exchanged == nil {
 		a.exchanged = map[string]*Agent{}
 	}
@@ -75,9 +97,7 @@ func (a *App) Exchange(ctx context.Context, agentToken string) (*Agent, error) {
 			delete(a.exchanged, k)
 		}
 	}
-	a.exchanged[agentToken] = ag
-	a.mu.Unlock()
-	return ag, nil
+	a.exchanged[key] = ag
 }
 
 func (ag *Agent) call(ctx context.Context, method, path string, body, out any) error {
@@ -136,7 +156,7 @@ func (ag *Agent) SubscribeAgentWideWhere(ctx context.Context, typ, wake, reason 
 // neither (APIError "session_required").
 type Subscription struct {
 	Type    string            `json:"type"`
-	Wake    string            `json:"wake,omitempty"` // "mentions" or "all"
+	Wake    string            `json:"wake,omitempty"` // "mentions", "all" or, joining a group, "none" (a member woken by nothing)
 	Reason  string            `json:"reason,omitempty"`
 	Filters map[string]string `json:"filters,omitempty"`
 	Session string            `json:"session,omitempty"` // the subscribing conversation's session: deliveries follow it

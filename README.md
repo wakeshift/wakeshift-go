@@ -1,6 +1,6 @@
 # Wakeshift SDK for Go
 
-Build apps that wake AI agents. Your app is an MCP server; agents (Claude Code, Codex, Cursor and others) call its tools, and when something happens your app publishes and [Wakeshift](https://wakeshift.ai) wakes every conversation subscribed to it, in whatever harness it runs.
+Build apps that wake AI agents. Your app is an MCP server that offers events; agents (Claude Code, Codex, ChatGPT, Cursor and others) subscribe to them, and when your app emits one, [Wakeshift](https://wakeshift.ai) wakes every subscribed conversation, in whatever harness it runs.
 
 ```sh
 go get github.com/wakeshift/wakeshift-go
@@ -12,11 +12,13 @@ import "github.com/wakeshift/wakeshift-go/appkit"
 
 ## Get a key
 
-In the [Wakeshift console](https://app.wakeshift.ai), open **Build → New app**. It gives you a test key, `wst_test_<app id>_…`: your app's ID and its private key in one string. Keep it secret; Wakeshift keeps only the public half.
+In the [Wakeshift console](https://app.wakeshift.ai), open **Build → New app**. It gives you a key, `wst_…`: your app's private key. Keep it secret; Wakeshift keeps only the public half.
 
 ```go
-app, err := appkit.FromKey(os.Getenv("WAKESHIFT_KEY"), "https://app.wakeshift.ai", "https://your-app.example/mcp")
+app, err := appkit.Open(ctx, os.Getenv("WAKESHIFT_KEY"), "", "https://your-app.example/mcp")
 ```
+
+An empty address reads `WAKESHIFT_CORE`, then defaults to `https://app.wakeshift.ai`. `Open` asks Wakeshift once which app the key is (`app.ID`). Older `wst_test_<app id>_…` keys still work; they need `WAKESHIFT_CORE`.
 
 ## Events
 
@@ -52,11 +54,11 @@ Every client can now subscribe: ChatGPT with MCP Events, every other agent with 
 msg.Emit(ctx, channelArgs{Channel: "eng"}, message{From: "ada", Text: "shipped it"})
 ```
 
-Every conversation subscribed to `#eng` wakes with it, framed as information from outside. A **personal** event (`Personal: true`) belongs to each subscriber: `Emit(…, appkit.To(user))` reaches that user's subscriptions only, so it can carry what only they may see ("it's your move: your cards are…").
+Every conversation subscribed to `#eng` wakes with it, framed as information from outside. A **personal** event (`Personal: true`) belongs to each subscriber: `Emit(…, appkit.To(user))` reaches that user's subscriptions only, so it can carry what only they may see ("it's your move: your cards are…"). A tool of your own can subscribe its caller in one step with `msg.Subscribe(ctx, in.Args.Call(req, user), args)`.
 
-## Subscribe and publish
+## Topics
 
-Events are built on topics, which you can use directly. A tool subscribes the conversation that called it to a topic. Add `appkit.Args` to the tool's arguments: they carry what Wakeshift needs to tell which conversation is calling (`session_key`, `harness`, `conversation_id`).
+Events are built on topics, which you can use directly: for publish URLs, waking one subscription with `Send`, or a subscribe tool of your own with `Once` or `Replay`. A tool subscribes the conversation that called it to a topic. Add `appkit.Args` to the tool's arguments: they carry what Wakeshift needs to tell which conversation is calling (`session_key`, `harness`, `conversation_id`).
 
 ```go
 type watchArgs struct {

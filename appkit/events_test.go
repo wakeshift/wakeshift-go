@@ -187,3 +187,45 @@ func TestDefineEvent(t *testing.T) {
 		t.Errorf("an unencodable payload: %v", err)
 	}
 }
+
+// A group's event (EventDef.Group) carries GroupMessage, needs no Text,
+// can't be personal or deleted on delivery, and has no Emit, PublishURL or
+// Subscribe: posts come from the group, and a conversation's membership
+// wakes it.
+func TestDefineGroupEvent(t *testing.T) {
+	type roomArgs struct {
+		Room string `json:"room"`
+	}
+	type other struct {
+		Text string `json:"text"`
+	}
+	app := &appkit.App{ID: "rooms"}
+	group := func(_ context.Context, _ appkit.Subscriber, a roomArgs) (string, error) {
+		return "app.rooms.room." + a.Room, nil
+	}
+	ev, err := appkit.DefineEvent(app, "room.message", appkit.EventDef[roomArgs, appkit.GroupMessage]{Description: "Posts in a room.", Group: group})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := appkit.DefineEvent(app, "room.other", appkit.EventDef[roomArgs, other]{Description: "x",
+		Group: func(context.Context, appkit.Subscriber, roomArgs) (string, error) { return "", nil }}); err == nil {
+		t.Error("a group's event with its own payload was accepted")
+	}
+	for name, d := range map[string]appkit.EventDef[roomArgs, appkit.GroupMessage]{
+		"room.personal": {Description: "x", Group: group, Personal: true},
+		"room.deleted":  {Description: "x", Group: group, DeleteOnDelivery: true},
+	} {
+		if _, err := appkit.DefineEvent(app, name, d); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if _, err := ev.Emit(context.Background(), roomArgs{Room: "a"}, appkit.GroupMessage{Subject: "x"}); err == nil {
+		t.Error("emitted a group's event")
+	}
+	if _, err := ev.PublishURL(context.Background(), roomArgs{Room: "a"}); err == nil {
+		t.Error("made a publish URL for a group's event")
+	}
+	if _, err := ev.Subscribe(context.Background(), appkit.Call{}, roomArgs{Room: "a"}); err == nil {
+		t.Error("subscribed a conversation to a group's event")
+	}
+}

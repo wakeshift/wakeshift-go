@@ -140,17 +140,42 @@ func detailOf(err error) string {
 }
 
 // addEventTools adds the tools to srv.
-func (a *App) addEventTools(srv *mcp.Server, userOf func(*auth.TokenInfo) string) {
+func (a *App) addEventTools(srv *mcp.Server, userOf func(*auth.TokenInfo) string, withAgent func(context.Context, *auth.TokenInfo, Call) (Call, error)) {
 	types := a.events()
 	names := make([]string, len(types))
 	for i, t := range types {
 		names[i] = t.name
+	}
+	// A group's event isn't for subscribe_events: a bridged conversation's
+	// membership of the group wakes it already.
+	var bridged []*eventType
+	var bridgedNames []string
+	for _, t := range types {
+		if t.group == nil {
+			bridged = append(bridged, t)
+			bridgedNames = append(bridgedNames, t.name)
+		}
 	}
 	user := func(req *mcp.CallToolRequest) string {
 		if req.Extra == nil {
 			return ""
 		}
 		return userOf(req.Extra.TokenInfo)
+	}
+	// callOf is the tool call as Wakeshift takes it (with the signed-in
+	// agent, for an app whose users sign in with Wakeshift; "" for the user
+	// if there's none).
+	callOf := func(ctx context.Context, req *mcp.CallToolRequest, args Args) Call {
+		call := args.Call(req, user(req))
+		var ti *auth.TokenInfo
+		if req.Extra != nil {
+			ti = req.Extra.TokenInfo
+		}
+		call, err := withAgent(ctx, ti, call)
+		if err != nil {
+			call.User = ""
+		}
+		return call
 	}
 	client := func(req *mcp.CallToolRequest) string {
 		if info := req.ClientInfo(); info != nil {
@@ -159,44 +184,46 @@ func (a *App) addEventTools(srv *mcp.Server, userOf func(*auth.TokenInfo) string
 		return ""
 	}
 	argsProp := map[string]any{"type": "object", "description": eventTools["arguments_argument"]}
-	srv.AddTool(&mcp.Tool{Name: subscribeTool, Description: eventTools["subscribe_description"] + eventTools["events_heading"] + eventsListing(types),
-		InputSchema: toolSchema(map[string]any{"event": map[string]any{"type": "string", "enum": names, "description": eventTools["event_argument"]},
-			"arguments": argsProp}, "event")},
-		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			var in struct {
-				Event     string          `json:"event"`
-				Arguments json.RawMessage `json:"arguments"`
-				Args
-			}
-			json.Unmarshal(req.Params.Arguments, &in)
-			t := a.eventByName(in.Event)
-			if t == nil {
-				return textResult(fill("unknown_event", "{event}", in.Event), true), nil
-			}
-			args := t.knownJSON(json.RawMessage(compact(in.Arguments)))
-			call := in.Args.Call(req, user(req))
-			if t.personal && call.User == "" {
-				return textResult(fill("personal_no_user", "{event}", t.name), true), nil
-			}
-			if t.authorize != nil && !t.authorize(ctx, Subscriber{User: call.User, Client: client(req)}, args) {
-				return textResult(fill("refused", "{event}", t.name), true), nil
-			}
-			var out struct {
-				EventSubscription struct {
+	if len(bridged) > 0 {
+		srv.AddTool(&mcp.Tool{Name: subscribeTool, Description: eventTools["subscribe_description"] + eventTools["events_heading"] + eventsListing(bridged),
+			InputSchema: toolSchema(map[string]any{"event": map[string]any{"type": "string", "enum": bridgedNames, "description": eventTools["event_argument"]},
+				"arguments": argsProp}, "event")},
+			func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				var in struct {
+					Event     string          `json:"event"`
 					Arguments json.RawMessage `json:"arguments"`
-					Created   bool            `json:"created"`
-				} `json:"event_subscription"`
-				Addition Addition `json:"addition"`
-			}
-			if err := a.appCall(ctx, "POST", "/api/apps/v1/event-subscriptions", map[string]any{"call": call, "name": t.name, "arguments": args}, &out); err != nil {
-				return textResult(fill("subscribe_failed", "{detail}", detailOf(err)), true), nil
-			}
-			key := "renewed"
-			if out.EventSubscription.Created {
-				key = "subscribed"
-			}
-			return out.Addition.Apply(&mcp.CallToolResult{}, fill(key, "{event}", t.name, "{arguments}", compact(out.EventSubscription.Arguments))), nil
-		})
+					Args
+				}
+				json.Unmarshal(req.Params.Arguments, &in)
+				t := a.eventByName(in.Event)
+				if t == nil || t.group != nil {
+					return textResult(fill("unknown_event", "{event}", in.Event), true), nil
+				}
+				args := t.knownJSON(json.RawMessage(compact(in.Arguments)))
+				call := callOf(ctx, req, in.Args)
+				if t.personal && call.User == "" {
+					return textResult(fill("personal_no_user", "{event}", t.name), true), nil
+				}
+				if t.authorize != nil && !t.authorize(ctx, Subscriber{User: call.User, Client: client(req)}, args) {
+					return textResult(fill("refused", "{event}", t.name), true), nil
+				}
+				var out struct {
+					EventSubscription struct {
+						Arguments json.RawMessage `json:"arguments"`
+						Created   bool            `json:"created"`
+					} `json:"event_subscription"`
+					Addition Addition `json:"addition"`
+				}
+				if err := a.appCall(ctx, "POST", "/api/apps/v1/event-subscriptions", map[string]any{"call": call, "name": t.name, "arguments": args}, &out); err != nil {
+					return textResult(fill("subscribe_failed", "{detail}", detailOf(err)), true), nil
+				}
+				key := "renewed"
+				if out.EventSubscription.Created {
+					key = "subscribed"
+				}
+				return out.Addition.Apply(&mcp.CallToolResult{}, fill(key, "{event}", t.name, "{arguments}", compact(out.EventSubscription.Arguments))), nil
+			})
+	}
 	srv.AddTool(&mcp.Tool{Name: unsubscribeTool, Description: eventTools["unsubscribe_description"],
 		InputSchema: toolSchema(map[string]any{"event": map[string]any{"type": "string", "enum": names, "description": eventTools["event_argument"]},
 			"arguments": argsProp, "id": map[string]any{"type": "string", "description": eventTools["id_argument"]}})},
@@ -231,7 +258,7 @@ func (a *App) addEventTools(srv *mcp.Server, userOf func(*auth.TokenInfo) string
 				Ended bool `json:"ended"`
 			}
 			if err := a.appCall(ctx, "POST", "/api/apps/v1/event-subscriptions/unsubscribe",
-				map[string]any{"call": in.Args.Call(req, u), "name": t.name, "arguments": args}, &out); err != nil {
+				map[string]any{"call": callOf(ctx, req, in.Args), "name": t.name, "arguments": args}, &out); err != nil {
 				return textResult(fill("unsubscribe_failed", "{detail}", detailOf(err)), true), nil
 			}
 			key := "not_subscribed"

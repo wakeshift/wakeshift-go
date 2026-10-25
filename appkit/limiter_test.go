@@ -55,3 +55,18 @@ func TestClientAddr(t *testing.T) {
 		}
 	}
 }
+
+// The exported RateLimiter limits per client address as the guest limits
+// do: the proxies' X-Forwarded-For entry, IPv6 by /64.
+func TestExportedRateLimiter(t *testing.T) {
+	l := NewRateLimiter(1, time.Minute, 1)
+	now := time.Now()
+	req := func(xff string) bool {
+		r := httptest.NewRequest("POST", "/oauth/register", nil)
+		r.Header.Set("X-Forwarded-For", xff)
+		return l.Allow(r, now)
+	}
+	if !req("2001:db8:1:2::1") || req("spoofed, 2001:db8:1:2::2") || !req("192.0.2.1") {
+		t.Fatal("the limiter didn't count per /64 from the proxy's entry")
+	}
+}

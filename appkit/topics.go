@@ -50,6 +50,10 @@ type Call struct {
 	// argument). It's a hint: it refines what Wakeshift recognised the call
 	// as (Grok Bot's calls are Cursor's), and never grants anything.
 	Harness string `json:"harness,omitempty"`
+	// AgentToken is, for an app whose users sign in with Wakeshift, the
+	// signed-in agent's exchanged token (Agent.Call sets it): Wakeshift
+	// takes the subscriber from it, never from User.
+	AgentToken string `json:"agent_token,omitempty"`
 }
 
 // Recognised is what Wakeshift recognised the calling conversation's harness
@@ -302,11 +306,13 @@ func (a *App) SubscriptionStatus(ctx context.Context, subscriptionID string) (Su
 	return out, err
 }
 
-// PublishURL is a capability URL that publishes to one topic: a POST's
-// body becomes an event (a JSON object as its data).
+// PublishURL is a capability URL that publishes to one topic (a POST's
+// body becomes an event, a JSON object as its data) or emits one event
+// (DefinedEvent.PublishURL: the body is its payload).
 type PublishURL struct {
 	ID    string `json:"id"`
-	Topic string `json:"topic"`
+	Topic string `json:"topic,omitempty"`
+	Event string `json:"event,omitempty"`
 	URL   string `json:"url"`
 }
 
@@ -318,9 +324,9 @@ func (a *App) PublishURL(ctx context.Context, topic string) (PublishURL, error) 
 	return out, err
 }
 
-// RevokePublishURL stops a publish URL working.
+// RevokePublishURL stops a publish URL working, a topic's or an event's.
 func (a *App) RevokePublishURL(ctx context.Context, id string) error {
-	return a.appCall(ctx, "DELETE", "/api/apps/v1/topics/publish-urls/"+url.PathEscape(id), nil, nil)
+	return a.appCall(ctx, "DELETE", "/api/apps/v1/events/publish-urls/"+url.PathEscape(id), nil, nil)
 }
 
 // Annotate returns what to add to any other tool result for the calling

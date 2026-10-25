@@ -53,11 +53,6 @@ func (a *App) actAsFresh(ctx context.Context, workspace, agent string) (*Agent, 
 		return nil, err
 	}
 	ag := &Agent{app: a, token: out.AccessToken, expires: time.Now().Add(time.Duration(out.ExpiresIn) * time.Second), Workspace: workspace, ID: agent}
-	a.mu.Lock()
-	if a.exchanged == nil {
-		a.exchanged = map[string]*Agent{}
-	}
-	a.exchanged[key] = ag
-	a.mu.Unlock()
+	a.cacheAgent(key, ag)
 	return ag, nil
 }

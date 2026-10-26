@@ -144,25 +144,6 @@ func TestWhatIsRetried(t *testing.T) {
 	}
 }
 
-// The JWKS fetch goes through the same retry.
-func TestRefusedJWKSFetchRetries(t *testing.T) {
-	fastRetries(t)
-	n := 0
-	a, _ := testApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n++
-		if n == 1 {
-			gfe500(w)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"keys":[{"kid":"k1","kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}]}`)
-	}))
-	keys, err := a.fetchJWKS(context.Background())
-	if err != nil || len(keys) != 1 || n != 2 {
-		t.Fatalf("keys %v, err %v, %d requests", keys, err, n)
-	}
-}
-
 // A retry waits within the request's context: cancelling it ends the wait.
 func TestRetryPauseHonoursContext(t *testing.T) {
 	old := retryPauses

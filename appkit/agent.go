@@ -3,15 +3,13 @@ package appkit
 import (
 	"context"
 	"encoding/json"
-	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 )
 
-// Agent is the app acting for one agent, through a token exchanged for the
-// agent's own (and so inside its consent).
+// Agent is the app acting for one of its users' agents (ActAs), under the
+// agent's grant in the workspace the app keeps for that user.
 type Agent struct {
 	app       *App
 	token     string
@@ -20,71 +18,20 @@ type Agent struct {
 	ID        string
 }
 
-// User is the agent as a personal event's subscriber, for an app whose
-// users sign in with Wakeshift: its workspace and ID ("<workspace>/<id>").
-// Emit to it with To(ag.User()).
+// User is the agent as a subscriber of a group's event routed to it (see
+// Identity.Agent): its workspace and ID ("<workspace>/<id>").
 func (ag *Agent) User() string { return ag.Workspace + "/" + ag.ID }
 
 // Call is the agent's conversation in session (its handle, e.g.
-// claude-code#2) as an app whose users sign in with Wakeshift passes it to
-// DefinedEvent.Subscribe and Unsubscribe: the subscription is the agent's,
-// in its person's workspace, under the consent they gave (Wakeshift checks
-// the token, and refuses once the consent is revoked).
+// claude-code#2) as passed to DefinedEvent.Subscribe and Unsubscribe for a
+// group's event: the subscription is the agent's, in the workspace the app
+// keeps for it, beside its memberships (Wakeshift checks the token, and
+// refuses once the grant is revoked).
 func (ag *Agent) Call(session string) Call {
 	return Call{User: ag.User(), Session: session, AgentToken: ag.token}
 }
 
-// Exchange turns the access token an agent sent the app into an Agent the
-// app can act for. Results are cached until shortly before they expire
-// (up to 15 minutes), so a revoked consent shows up as the Agent's calls
-// failing (APIError "no_grant"), not as Exchange refusing (APIError
-// "invalid_grant", once the cache entry is gone): treat both as signed out.
-func (a *App) Exchange(ctx context.Context, agentToken string) (*Agent, error) {
-	a.mu.Lock()
-	if ag, ok := a.exchanged[agentToken]; ok && time.Until(ag.expires) > 30*time.Second {
-		a.mu.Unlock()
-		return ag, nil
-	}
-	a.mu.Unlock()
-	claims, err := a.Verify(ctx, agentToken)
-	if err != nil {
-		return nil, err
-	}
-	assertion, err := a.assertion()
-	if err != nil {
-		return nil, err
-	}
-	form := url.Values{
-		"grant_type":            {"urn:ietf:params:oauth:grant-type:token-exchange"},
-		"subject_token":         {agentToken},
-		"subject_token_type":    {"urn:ietf:params:oauth:token-type:access_token"},
-		"client_assertion_type": {"urn:ietf:params:oauth:client-assertion-type:jwt-bearer"},
-		"client_assertion":      {assertion},
-	}
-	req, _ := http.NewRequestWithContext(ctx, "POST", a.core()+"/oauth/token", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := a.do(a.client(), req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var out struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int64  `json:"expires_in"`
-		Error       string `json:"error"`
-		Description string `json:"error_description"`
-	}
-	json.NewDecoder(resp.Body).Decode(&out)
-	if resp.StatusCode != http.StatusOK {
-		return nil, &APIError{Status: resp.StatusCode, Code: out.Error, Message: out.Description}
-	}
-	ag := &Agent{app: a, token: out.AccessToken, expires: time.Now().Add(time.Duration(out.ExpiresIn) * time.Second),
-		Workspace: claims.Workspace, ID: claims.Agent}
-	a.cacheAgent(agentToken, ag)
-	return ag, nil
-}
-
-// cacheAgent keeps ag under key in the cache of exchanged tokens, dropping
+// cacheAgent keeps ag under key in the cache of agents' tokens, dropping
 // the ones that have expired.
 func (a *App) cacheAgent(key string, ag *Agent) {
 	a.mu.Lock()

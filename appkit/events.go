@@ -18,196 +18,214 @@ import (
 	"github.com/wakeshift/wakeshift-go/internal/mcpevents/event"
 )
 
-// EventsOptions configure ServeEvents.
-type EventsOptions struct {
-	// User is the app's ID for the person behind a request, from the
-	// endpoint's authentication ("" for none): subscriptions belong to them,
-	// a personal event's subscriptions need one, and list_subscriptions
-	// lists theirs. Guest sign-in: the TokenInfo's UserID.
-	User func(*auth.TokenInfo) string
-	// Agent, for an app whose users sign in with Wakeshift (accounts:
-	// "wakeshift"), is the signed-in agent behind a request (Exchange its
-	// token): its subscriptions are made with its token, in its person's
-	// workspace, and User is the agent's (Agent.User). A headless app may
-	// set it too (ActAs, for the guest's workspace and agent): a native
-	// subscription to a group's event (EventDef.Group) then lives in that
-	// workspace, beside the agent's memberships, and User is Agent.User;
-	// every other subscription is as without it.
-	Agent func(context.Context, *auth.TokenInfo) (*Agent, error)
+// Identity is who's behind a request to the app's MCP endpoint, as the app
+// knows them (AttachOptions.Identify).
+type Identity struct {
+	// User is the app's ID for the person ("" for none): their
+	// subscriptions belong to them, a personal event's subscriptions need
+	// one, and list_subscriptions lists theirs.
+	User string
+	// Agent is the app's agent behind the request (ActAs, for a guest's
+	// workspace and agent), if any: a native subscription to a group's
+	// event (EventDef.Group) then lives in that workspace, beside the
+	// agent's memberships, and the user is Agent.User(); every other
+	// subscription is as without it.
+	Agent *Agent
 }
 
-// ServeEvents lets every client subscribe to the app's event types (define
-// them first, with DefineEvent), and returns the middleware that serves
-// MCP Events (SEP-3415, the revision event.Revision names) on the app's
-// MCP endpoint.
+// AttachOptions configure Attach.
+type AttachOptions struct {
+	// Identify tells who's behind a request, from the endpoint's
+	// authentication (it isn't called for a request with none). An error
+	// counts as no user. Guest sign-in: the TokenInfo's UserID, and the
+	// agent from ActAs for an app with group events.
+	Identify func(context.Context, *auth.TokenInfo) (Identity, error)
+}
+
+// Attachment is Wakeshift attached to an MCP server (Attach).
+type Attachment struct {
+	app      *App
+	identify func(context.Context, *auth.TokenInfo) Identity
+}
+
+// Attach attaches Wakeshift to the app's MCP server: the one call that
+// connects the two. Today it serves MCP Events and the event tools, so
+// every client can subscribe to the app's event types (define them first,
+// with DefineEvent); Wrap puts it in front of the MCP endpoint's handler.
 //
-//   - Clients that speak MCP Events (ChatGPT) subscribe natively: the
-//     middleware advertises the events capability (server/discover and
-//     initialize, under both the draft's extension key and the top-level
-//     key ChatGPT reads), answers events/list with the event types, and
-//     passes events/subscribe and events/unsubscribe to Wakeshift, which
-//     verifies the client's callback and POSTs occurrences to it, signed,
-//     in order (docs/mcp-events-bridge.md). It speaks two dialects, chosen
-//     per request by the client's clientInfo (or User-Agent): ChatGPT's and
-//     the draft's. An Mcp-Name header, when present, must match
-//     params.name.
+//   - Clients that speak MCP Events (ChatGPT) subscribe natively: Wrap
+//     advertises the events capability (server/discover and initialize,
+//     under both the draft's extension key and the top-level key ChatGPT
+//     reads), answers events/list with the event types, and passes
+//     events/subscribe and events/unsubscribe to Wakeshift, which verifies
+//     the client's callback and POSTs occurrences to it, signed, in order
+//     (docs/mcp-events-bridge.md). It speaks the revision event.Revision
+//     names, in two dialects chosen per request by the client's clientInfo
+//     (or User-Agent): ChatGPT's and the draft's. An Mcp-Name header, when
+//     present, must match params.name.
 //   - Every other client subscribes with the subscribe_events tool, which
-//     ServeEvents adds to srv (tools/list hides it from native clients),
-//     and Wakeshift wakes it the way its harness can be woken.
+//     Attach adds to srv (tools/list hides it from native clients), and
+//     Wakeshift wakes it the way its harness can be woken.
 //   - Every client can list its subscriptions (list_subscriptions) and stop
 //     one (unsubscribe_events): a headless app's users have no other way.
 //
 // Call it once per server, after the last DefineEvent (calling it again
 // replaces the tools, as the MCP SDK's AddTool does). Each event type's
-// Authorize runs before any subscription. The tools'
-// wording is fixed, and the TypeScript SDK's is the same
-// (sdk/typescript/test/event-tools.json). Put the middleware after the
-// endpoint's authentication, before the MCP handler:
+// Authorize runs before any subscription. The tools' wording is fixed, and
+// the TypeScript SDK's is the same (sdk/typescript/test/event-tools.json).
+// Wrap the MCP handler after the endpoint's authentication:
 //
-//	events := app.ServeEvents(srv, appkit.EventsOptions{User: func(ti *auth.TokenInfo) string { return ti.UserID }})
+//	attached := app.Attach(srv, appkit.AttachOptions{
+//		Identify: func(_ context.Context, ti *auth.TokenInfo) (appkit.Identity, error) {
+//			return appkit.Identity{User: ti.UserID}, nil
+//		},
+//	})
 //	h := mcp.NewStreamableHTTPHandler(…, &mcp.StreamableHTTPOptions{Stateless: true})
-//	mux.Handle("/mcp", requireAuth(events(h)))
-func (a *App) ServeEvents(srv *mcp.Server, opts EventsOptions) func(http.Handler) http.Handler {
-	userOf := func(ti *auth.TokenInfo) string {
-		if ti == nil || opts.User == nil {
-			return ""
+//	mux.Handle("/mcp", requireAuth(attached.Wrap(h)))
+func (a *App) Attach(srv *mcp.Server, opts AttachOptions) *Attachment {
+	at := &Attachment{app: a, identify: func(ctx context.Context, ti *auth.TokenInfo) Identity {
+		if ti == nil || opts.Identify == nil {
+			return Identity{}
 		}
-		return opts.User(ti)
-	}
-	// withAgent adds the signed-in agent to a call, for an app whose users
-	// sign in with Wakeshift.
-	withAgent := func(ctx context.Context, ti *auth.TokenInfo, call Call) (Call, error) {
-		if opts.Agent == nil {
-			return call, nil
-		}
-		if ti == nil {
-			return call, errors.New("not signed in")
-		}
-		ag, err := opts.Agent(ctx, ti)
+		id, err := opts.Identify(ctx, ti)
 		if err != nil {
-			return call, err
+			return Identity{}
 		}
-		call.User, call.AgentToken = ag.User(), ag.token
-		return call, nil
+		return id
+	}}
+	a.addEventTools(srv, at.identify)
+	// The MCP server's own pipeline: every request Wrap passes on comes
+	// through here, the place for anything per tool call.
+	srv.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler { return next })
+	return at
+}
+
+// Wrap puts Wakeshift in front of the MCP endpoint's handler, after the
+// endpoint's authentication: today, MCP Events' methods and capability.
+func (at *Attachment) Wrap(next http.Handler) http.Handler {
+	a := at.app
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			next.ServeHTTP(w, r)
+			return
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<20))
+		if tooBig := new(http.MaxBytesError); errors.As(err, &tooBig) {
+			http.Error(w, "the request is over 4 MB", http.StatusRequestEntityTooLarge)
+			return
+		}
+		if err != nil {
+			http.Error(w, "can't read the request", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if json.Unmarshal(body, &req) != nil || len(req.ID) == 0 {
+			next.ServeHTTP(w, r) // a batch, a notification or a response
+			return
+		}
+		switch req.Method {
+		case "server/discover", "initialize":
+			withEventsCapability(next, w, r)
+			return
+		case "tools/list":
+			if nativeClient(r, req.Params) {
+				withoutTool(next, w, r, subscribeTool)
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		case "events/list":
+			defs := []any{}
+			for _, t := range a.events() {
+				defs = append(defs, t.definition())
+			}
+			rpcResult(w, req.ID, map[string]any{"resultType": event.ResultType, "events": defs})
+			return
+		case "events/subscribe", "events/unsubscribe", "events/poll", "events/stream":
+		default:
+			next.ServeHTTP(w, r)
+			return
+		}
+		var p eventParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			rpcError(w, req.ID, event.InvalidParams, "invalid params", nil)
+			return
+		}
+		call := at.identify(r.Context(), auth.TokenInfoFromContext(r.Context())).apply(Call{Meta: p.Meta, UserAgent: r.Header.Get("User-Agent")})
+		if info, ok := p.Meta["io.modelcontextprotocol/clientInfo"].(map[string]any); ok {
+			call.Client, _ = info["name"].(string)
+		}
+		dialect := event.DialectOf(call.Client, call.UserAgent)
+		codes := event.CodesFor(dialect)
+		if h := r.Header.Get(event.NameHeader); h != "" {
+			if v, ok := event.HeaderValue(h); !ok || v != p.Name {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{
+					"code": event.HeaderMismatch, "message": "Header mismatch: Mcp-Name doesn't match params.name"}})
+				return
+			}
+		}
+		if req.Method == "events/poll" || req.Method == "events/stream" {
+			rpcError(w, req.ID, codes.Unsupported, "only webhook delivery is offered", map[string]string{"feature": "deliveryMode",
+				"value": strings.TrimPrefix(req.Method, "events/")})
+			return
+		}
+		t := a.eventByName(p.Name)
+		if t == nil {
+			nameJSON, _ := json.Marshal(p.Name)
+			rpcError(w, req.ID, codes.NotFound, fill("native_unknown_event", "{event}", string(nameJSON)), map[string]string{"kind": "event"})
+			return
+		}
+		p.Arguments = t.known(p.Arguments)
+		if req.Method == "events/subscribe" && p.Delivery.Mode != "webhook" {
+			rpcError(w, req.ID, codes.Unsupported, `delivery.mode must be "webhook": the only delivery offered`,
+				map[string]string{"feature": "deliveryMode", "value": p.Delivery.Mode})
+			return
+		}
+		if call.User == "" {
+			rpcError(w, req.ID, codes.Forbidden, eventTools["native_no_user"], nil)
+			return
+		}
+		if req.Method == "events/subscribe" && t.authorize != nil {
+			args, _ := json.Marshal(p.Arguments)
+			if !t.authorize(r.Context(), Subscriber{User: call.User, Client: call.Client, Native: true}, args) {
+				rpcError(w, req.ID, codes.Forbidden, fill("native_refused", "{event}", t.name), nil)
+				return
+			}
+		}
+		if req.Method == "events/subscribe" && t.group != nil {
+			args, _ := json.Marshal(p.Arguments)
+			g, gerr := t.group(r.Context(), Subscriber{User: call.User, Client: call.Client, Native: true}, args)
+			if gerr != nil || g == "" {
+				rpcError(w, req.ID, codes.Forbidden, fill("native_refused", "{event}", t.name), nil)
+				return
+			}
+			p.group = g
+		}
+		out, err := a.eventCall(r.Context(), req.Method, call, dialect, p)
+		if err != nil {
+			code, msg, data := rpcErrorOf(err, codes)
+			rpcError(w, req.ID, code, msg, data)
+			return
+		}
+		rpcResult(w, req.ID, out)
+	})
+}
+
+// apply puts the identity in a call: the user, and the agent's token
+// (whose user is the agent's) if there's an agent.
+func (id Identity) apply(call Call) Call {
+	call.User = id.User
+	if id.Agent != nil {
+		call.User, call.AgentToken = id.Agent.User(), id.Agent.token
 	}
-	a.addEventTools(srv, userOf, withAgent)
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost {
-				next.ServeHTTP(w, r)
-				return
-			}
-			body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<20))
-			if tooBig := new(http.MaxBytesError); errors.As(err, &tooBig) {
-				http.Error(w, "the request is over 4 MB", http.StatusRequestEntityTooLarge)
-				return
-			}
-			if err != nil {
-				http.Error(w, "can't read the request", http.StatusBadRequest)
-				return
-			}
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			var req struct {
-				ID     json.RawMessage `json:"id"`
-				Method string          `json:"method"`
-				Params json.RawMessage `json:"params"`
-			}
-			if json.Unmarshal(body, &req) != nil || len(req.ID) == 0 {
-				next.ServeHTTP(w, r) // a batch, a notification or a response
-				return
-			}
-			switch req.Method {
-			case "server/discover", "initialize":
-				withEventsCapability(next, w, r)
-				return
-			case "tools/list":
-				if nativeClient(r, req.Params) {
-					withoutTool(next, w, r, subscribeTool)
-					return
-				}
-				next.ServeHTTP(w, r)
-				return
-			case "events/list":
-				defs := []any{}
-				for _, t := range a.events() {
-					defs = append(defs, t.definition())
-				}
-				rpcResult(w, req.ID, map[string]any{"resultType": event.ResultType, "events": defs})
-				return
-			case "events/subscribe", "events/unsubscribe", "events/poll", "events/stream":
-			default:
-				next.ServeHTTP(w, r)
-				return
-			}
-			var p eventParams
-			if err := json.Unmarshal(req.Params, &p); err != nil {
-				rpcError(w, req.ID, event.InvalidParams, "invalid params", nil)
-				return
-			}
-			call := Call{Meta: p.Meta, UserAgent: r.Header.Get("User-Agent"), User: userOf(auth.TokenInfoFromContext(r.Context()))}
-			if info, ok := p.Meta["io.modelcontextprotocol/clientInfo"].(map[string]any); ok {
-				call.Client, _ = info["name"].(string)
-			}
-			if call, err = withAgent(r.Context(), auth.TokenInfoFromContext(r.Context()), call); err != nil {
-				call.User = "" // refused below, as a caller with no user is
-			}
-			dialect := event.DialectOf(call.Client, call.UserAgent)
-			codes := event.CodesFor(dialect)
-			if h := r.Header.Get(event.NameHeader); h != "" {
-				if v, ok := event.HeaderValue(h); !ok || v != p.Name {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusBadRequest)
-					json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{
-						"code": event.HeaderMismatch, "message": "Header mismatch: Mcp-Name doesn't match params.name"}})
-					return
-				}
-			}
-			if req.Method == "events/poll" || req.Method == "events/stream" {
-				rpcError(w, req.ID, codes.Unsupported, "only webhook delivery is offered", map[string]string{"feature": "deliveryMode",
-					"value": strings.TrimPrefix(req.Method, "events/")})
-				return
-			}
-			t := a.eventByName(p.Name)
-			if t == nil {
-				nameJSON, _ := json.Marshal(p.Name)
-				rpcError(w, req.ID, codes.NotFound, fill("native_unknown_event", "{event}", string(nameJSON)), map[string]string{"kind": "event"})
-				return
-			}
-			p.Arguments = t.known(p.Arguments)
-			if req.Method == "events/subscribe" && p.Delivery.Mode != "webhook" {
-				rpcError(w, req.ID, codes.Unsupported, `delivery.mode must be "webhook": the only delivery offered`,
-					map[string]string{"feature": "deliveryMode", "value": p.Delivery.Mode})
-				return
-			}
-			if call.User == "" {
-				rpcError(w, req.ID, codes.Forbidden, eventTools["native_no_user"], nil)
-				return
-			}
-			if req.Method == "events/subscribe" && t.authorize != nil {
-				args, _ := json.Marshal(p.Arguments)
-				if !t.authorize(r.Context(), Subscriber{User: call.User, Client: call.Client, Native: true}, args) {
-					rpcError(w, req.ID, codes.Forbidden, fill("native_refused", "{event}", t.name), nil)
-					return
-				}
-			}
-			if req.Method == "events/subscribe" && t.group != nil {
-				args, _ := json.Marshal(p.Arguments)
-				g, gerr := t.group(r.Context(), Subscriber{User: call.User, Client: call.Client, Native: true}, args)
-				if gerr != nil || g == "" {
-					rpcError(w, req.ID, codes.Forbidden, fill("native_refused", "{event}", t.name), nil)
-					return
-				}
-				p.group = g
-			}
-			out, err := a.eventCall(r.Context(), req.Method, call, dialect, p)
-			if err != nil {
-				code, msg, data := rpcErrorOf(err, codes)
-				rpcError(w, req.ID, code, msg, data)
-				return
-			}
-			rpcResult(w, req.ID, out)
-		})
-	}
+	return call
 }
 
 // nativeClient reports whether the request comes from a client that

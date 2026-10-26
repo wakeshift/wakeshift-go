@@ -106,8 +106,8 @@ func sampleApp(t *testing.T) *App {
 func TestEventsListGolden(t *testing.T) {
 	app := sampleApp(t)
 	srv := mcp.NewServer(&mcp.Implementation{Name: "sample", Version: "1"}, nil)
-	events := app.ServeEvents(srv, EventsOptions{})
-	hs := httptest.NewServer(events(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv },
+	attached := app.Attach(srv, AttachOptions{})
+	hs := httptest.NewServer(attached.Wrap(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv },
 		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})))
 	defer hs.Close()
 	result := func(method string) map[string]any {

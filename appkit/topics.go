@@ -11,7 +11,7 @@ import (
 	"github.com/wakeshift/wakeshift-go/internal/harnesses"
 )
 
-// Topics (docs/topics.md) let an app's tools subscribe the calling
+// Topics (https://wakeshift.ai/docs/topics) let an app's tools subscribe the calling
 // conversation to things, and the app wake every subscriber by publishing.
 // The app never sees workspaces, agents, sessions or harnesses: Wakeshift
 // works them out from the Call, and the result of Subscribe says what the

@@ -6,10 +6,9 @@ import (
 	"time"
 )
 
-// Headless apps (the default; see docs/headless.md) identify their own
+// Headless apps (the default; see https://wakeshift.ai/docs/users) identify their own
 // users. Wakeshift keeps a workspace for each user, owned by the app; the
-// app adds the user's agent to it, and then acts for the agent with ActAs,
-// as an app in account mode does after Exchange.
+// app adds the user's agent to it, and then acts for the agent with ActAs.
 
 // Workspace returns the workspace Wakeshift keeps for one of the app's
 // users (externalID is the app's own ID for them), creating it on first use.

@@ -1,9 +1,9 @@
 package appkit
 
-// Event types (docs/mcp-events-bridge.md): what an app offers to be
+// Event types (https://wakeshift.ai/docs/events): what an app offers to be
 // subscribed to, by name and arguments, the way MCP Events lists them. An
 // app defines each one once, at startup, with DefineEvent, and sends an
-// occurrence with Emit; ServeEvents (events.go) lets every client
+// occurrence with Emit; Attach (events.go) lets every client
 // subscribe: natively (MCP Events: ChatGPT) or through the tools it adds
 // (every other harness), and Wakeshift delivers either way.
 //
@@ -23,7 +23,7 @@ package appkit
 //	message.Emit(ctx, msgArgs{Channel: "eng"}, msg{From: "ada", Text: "shipped it"})
 //
 // It's the TypeScript SDK's API (wake.defineEvent, event.emit,
-// wake.serveEvents), with Go types where that has zod schemas; the two
+// wake.attach), with Go types where that has zod schemas; the two
 // SDKs' events/list and tools are checked against the same golden files
 // (sdk/typescript/test/events-list.json, event-tools.json).
 
@@ -58,8 +58,8 @@ type EventDef[A, P any] struct {
 	// Authorize says whether s may subscribe with these arguments (nil:
 	// everyone). It runs before any subscription, native or bridged.
 	Authorize func(ctx context.Context, s Subscriber, args A) bool
-	// Personal: each subscription belongs to its subscriber (ServeEvents'
-	// user), and Emit sends an occurrence to one of them (To), so it may
+	// Personal: each subscription belongs to its subscriber (Identity.User),
+	// and Emit sends an occurrence to one of them (To), so it may
 	// carry that subscriber's own private view. Nothing in the arguments
 	// names the subscriber: Wakeshift takes it from the subscriber's own
 	// sign-in.
@@ -71,7 +71,7 @@ type EventDef[A, P any] struct {
 	// messages. One that isn't delivered expires as any other does. An
 	// agent can't have it again after delivery: a replay skips it.
 	DeleteOnDelivery bool
-	// Group makes the event a group's posts (docs/delivery-destinations.md):
+	// Group makes the event a group's posts:
 	// it names the app's group (its type, app.<app>.…) that a subscription
 	// with these arguments is for. A client that subscribes natively (MCP
 	// Events) then gets the posts its agent's membership of that group
@@ -154,7 +154,7 @@ type GroupMessage struct {
 
 // Subscriber is who's subscribing: what Authorize decides on.
 type Subscriber struct {
-	// User is the app's ID for the person (ServeEvents' user), if it has one.
+	// User is the app's ID for the person (Identity.User), if it has one.
 	User string
 	// Client is the MCP client's name, if known.
 	Client string
@@ -193,7 +193,7 @@ var (
 // DefineEvent defines one of the app's event types: name is what clients
 // subscribe to (chat.message, game.turn: lowercase dot-separated words, at
 // most 64 characters, not wakeshift.*). Define every event before
-// PublishManifest, which publishes them, and before ServeEvents.
+// PublishManifest, which publishes them, and before Attach.
 func DefineEvent[A, P any](app *App, name string, def EventDef[A, P]) (*DefinedEvent[A, P], error) {
 	switch {
 	case !eventNameRE.MatchString(name) || len(name) > 64:

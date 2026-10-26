@@ -1,6 +1,6 @@
 package appkit
 
-// The tools ServeEvents adds: subscribe_events (for clients that don't
+// The tools Attach adds: subscribe_events (for clients that don't
 // subscribe with MCP Events themselves), unsubscribe_events and
 // list_subscriptions (for everyone). Their wording is the TypeScript SDK's
 // (sdk/typescript/src/events.ts, EVENT_TOOL_TEXT), and both SDKs check it
@@ -140,7 +140,7 @@ func detailOf(err error) string {
 }
 
 // addEventTools adds the tools to srv.
-func (a *App) addEventTools(srv *mcp.Server, userOf func(*auth.TokenInfo) string, withAgent func(context.Context, *auth.TokenInfo, Call) (Call, error)) {
+func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *auth.TokenInfo) Identity) {
 	types := a.events()
 	names := make([]string, len(types))
 	for i, t := range types {
@@ -156,26 +156,19 @@ func (a *App) addEventTools(srv *mcp.Server, userOf func(*auth.TokenInfo) string
 			bridgedNames = append(bridgedNames, t.name)
 		}
 	}
-	user := func(req *mcp.CallToolRequest) string {
+	who := func(ctx context.Context, req *mcp.CallToolRequest) Identity {
 		if req.Extra == nil {
-			return ""
+			return Identity{}
 		}
-		return userOf(req.Extra.TokenInfo)
+		return identify(ctx, req.Extra.TokenInfo)
 	}
-	// callOf is the tool call as Wakeshift takes it (with the signed-in
-	// agent, for an app whose users sign in with Wakeshift; "" for the user
-	// if there's none).
+	user := func(ctx context.Context, req *mcp.CallToolRequest) string {
+		return who(ctx, req).apply(Call{}).User
+	}
+	// callOf is the tool call as Wakeshift takes it (with the app's agent,
+	// if Identify gives one; "" for the user if there's none).
 	callOf := func(ctx context.Context, req *mcp.CallToolRequest, args Args) Call {
-		call := args.Call(req, user(req))
-		var ti *auth.TokenInfo
-		if req.Extra != nil {
-			ti = req.Extra.TokenInfo
-		}
-		call, err := withAgent(ctx, ti, call)
-		if err != nil {
-			call.User = ""
-		}
-		return call
+		return who(ctx, req).apply(args.Call(req, ""))
 	}
 	client := func(req *mcp.CallToolRequest) string {
 		if info := req.ClientInfo(); info != nil {
@@ -235,7 +228,7 @@ func (a *App) addEventTools(srv *mcp.Server, userOf func(*auth.TokenInfo) string
 				Args
 			}
 			json.Unmarshal(req.Params.Arguments, &in)
-			u := user(req)
+			u := user(ctx, req)
 			if in.ID != "" {
 				if u == "" {
 					return textResult(eventTools["end_no_user"], true), nil
@@ -269,7 +262,7 @@ func (a *App) addEventTools(srv *mcp.Server, userOf func(*auth.TokenInfo) string
 		})
 	srv.AddTool(&mcp.Tool{Name: listTool, Description: eventTools["list_description"], InputSchema: toolSchema(nil)},
 		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			u := user(req)
+			u := user(ctx, req)
 			if u == "" {
 				return textResult(eventTools["list_no_user"], true), nil
 			}

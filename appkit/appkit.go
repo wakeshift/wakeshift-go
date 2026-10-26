@@ -52,12 +52,7 @@ type App struct {
 	HTTP   *http.Client // default: one with a 20s timeout
 
 	mu        sync.Mutex
-	fetchMu   sync.Mutex
-	jwks      map[string]ed25519.PublicKey
-	jwksAt    time.Time         // last successful fetch
-	jwksNext  time.Time         // the soonest the next fetch may run
-	jwksFail  bool              // the last fetch failed
-	exchanged map[string]*Agent // by the agent's token
+	exchanged map[string]*Agent // ActAs's, by workspace and agent
 
 	eventTypes []*eventType // DefineEvent's, in order
 }
@@ -168,12 +163,10 @@ func (a *App) appCall(ctx context.Context, method, path string, body, out any) e
 // Manifest is what the app may do (see the core's apps.Manifest).
 type Manifest struct {
 	Description string `json:"description"`
-	// Accounts is who identifies the app's users: "app" (the default,
-	// headless: see GuestAuth and App.Workspace) or "wakeshift" (users sign
-	// in with Wakeshift; see Exchange).
-	Accounts  string          `json:"accounts,omitempty"`
-	Agent     *AgentScope     `json:"agent,omitempty"`
-	Workspace *WorkspaceScope `json:"workspace,omitempty"`
+	// The app identifies its own users (GuestAuth, or its own sign-in) and
+	// acts for their agents in workspaces Wakeshift keeps for them
+	// (App.Workspace, AddAgent, ActAs).
+	Agent *AgentScope `json:"agent,omitempty"`
 	// Events are the app's event types. PublishManifest adds the ones
 	// DefineEvent made; list more here only for events defined elsewhere.
 	Events []ManifestEvent `json:"events,omitempty"`
@@ -190,9 +183,6 @@ type AgentScope struct {
 	// other people's workspaces can wake it (see CreateGroup).
 	Groups  bool `json:"groups,omitempty"`
 	TTLDays int  `json:"ttl_days"`
-	// RedirectURIs: for an app with its own sign-in (see SignIn), where
-	// Wakeshift may return the user.
-	RedirectURIs []string `json:"redirect_uris,omitempty"`
 	// StartPrompt is what the user should say to their agent once it's
 	// connected (e.g. "Join a game of Nightfall"). Wakeshift shows it after
 	// consent. At most 120 characters.
@@ -203,12 +193,6 @@ type AgentScope struct {
 type WakeLimit struct {
 	Seconds int `json:"seconds"`
 	Max     int `json:"max"`
-}
-
-type WorkspaceScope struct {
-	Publish    []ScopeEvent `json:"publish"`
-	ConnectURL string       `json:"connect_url,omitempty"`
-	TTLDays    int          `json:"ttl_days"`
 }
 
 type ScopeEvent struct {
@@ -229,50 +213,10 @@ func (a *App) PublishManifest(ctx context.Context, m Manifest) error {
 	return a.appCall(ctx, "PUT", "/api/apps/v1/manifest", m, nil)
 }
 
-// Connection is a workspace the user connected to the app.
-type Connection struct {
-	Workspace string `json:"workspace"`
-	GrantID   string `json:"grant_id"`
-	UserID    string `json:"user_id"`
-	// For showing the user what they're connecting.
-	WorkspaceName string `json:"workspace_name,omitempty"`
-	UserEmail     string `json:"user_email,omitempty"`
-}
-
-// Redeem turns the ticket Wakeshift put on the app's connect URL into the
-// workspace and grant the app may publish under.
-func (a *App) Redeem(ctx context.Context, ticket string) (Connection, error) {
-	var c Connection
-	err := a.appCall(ctx, "POST", "/api/apps/v1/connect/redeem", map[string]string{"ticket": ticket}, &c)
-	return c, err
-}
-
-// SourceEvent is an event from outside (a Slack message, an email).
-type SourceEvent struct {
-	Type           string            `json:"type"`
-	SourceEventID  string            `json:"source_event_id"` // retries with the same ID are stored once
-	SourceRevision string            `json:"source_revision,omitempty"`
-	OccurredAt     time.Time         `json:"occurred_at"`
-	From           Party             `json:"from"`
-	Subject        string            `json:"subject"`
-	Body           string            `json:"body,omitempty"`
-	Data           any               `json:"data,omitempty"`
-	Attrs          map[string]string `json:"attrs,omitempty"`
-}
-
+// Party is who an event is from.
 type Party struct {
 	Kind string `json:"kind"`
 	ID   string `json:"id"`
-}
-
-// PublishToWorkspace adds a source event to a connected workspace.
-func (a *App) PublishToWorkspace(ctx context.Context, c Connection, e SourceEvent) error {
-	body := struct {
-		SourceEvent
-		Workspace string `json:"workspace"`
-		GrantID   string `json:"grant_id"`
-	}{e, c.Workspace, c.GrantID}
-	return a.appCall(ctx, "POST", "/api/apps/v1/workspace/events", body, nil)
 }
 
 // ── Groups ───────────────────────────────────────────────────────────────
@@ -366,158 +310,6 @@ func (a *App) PostToGroup(ctx context.Context, typ string, p GroupPost) (Posted,
 	var out Posted
 	err := a.appCall(ctx, "POST", groupPath(typ)+"/events", p, &out)
 	return out, err
-}
-
-// ── Sign in with Wakeshift (the app's MCP server) ────────────────────────
-
-// ResourceMetadata serves the app's OAuth protected-resource metadata (RFC
-// 9728), which tells MCP clients to sign in with Wakeshift. Mount it at
-// /.well-known/oauth-protected-resource (and the same path suffixed with the
-// MCP endpoint's path).
-func (a *App) ResourceMetadata(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"resource":                 a.MCPURL,
-		"authorization_servers":    []string{a.core()},
-		"bearer_methods_supported": []string{"header"},
-	})
-}
-
-// Challenge answers an MCP request that sent no bearer token: 401 with a
-// pointer to the resource metadata. For a request whose token was refused,
-// use RefuseToken (or let RequireBearer choose).
-func (a *App) Challenge(w http.ResponseWriter) { challenge(w, a.metadataURL(), nil) }
-
-// RefuseToken answers an MCP request whose bearer token failed verification
-// (err is why, e.g. from Verify): Challenge's 401, adding
-// error="invalid_token" (RFC 6750 3.1), which tells clients to refresh
-// rather than sign in again.
-func (a *App) RefuseToken(w http.ResponseWriter, err error) {
-	if err == nil {
-		err = &TokenError{Reason: ReasonInvalid}
-	}
-	challenge(w, a.metadataURL(), err)
-}
-
-func (a *App) metadataURL() string {
-	u, _ := url.Parse(a.MCPURL)
-	return u.Scheme + "://" + u.Host + "/.well-known/oauth-protected-resource"
-}
-
-// Claims are a verified access token's claims.
-type Claims struct {
-	Issuer    string `json:"iss"`
-	Subject   string `json:"sub"`
-	Audience  string `json:"aud"`
-	ClientID  string `json:"client_id"`
-	Expires   int64  `json:"exp"`
-	Workspace string `json:"wakeshift_tenant"`
-	Agent     string `json:"wakeshift_agent"`
-}
-
-// Verify checks an access token an MCP client sent: signed by Wakeshift
-// (keys from its JWKS), issued for this app's MCP URL, not expired. A
-// refused token's error is a *TokenError saying why.
-func (a *App) Verify(ctx context.Context, token string) (Claims, error) {
-	var c Claims
-	reason := ReasonInvalid
-	_, err := jws.Verify(token, "at+jwt", func(h jws.Header) ed25519.PublicKey {
-		k, checked := a.key(ctx, h.Kid)
-		switch {
-		case k == nil && checked:
-			reason = ReasonUnknownKey
-		case k == nil:
-			reason = ReasonKeysUnavailable
-		}
-		return k
-	}, &c)
-	now := time.Now()
-	switch {
-	case err != nil:
-		return c, &TokenError{Reason: reason}
-	case c.Issuer != a.core():
-		return c, &TokenError{Reason: ReasonIssuer}
-	case c.Audience != a.MCPURL:
-		return c, &TokenError{Reason: ReasonAudience}
-	case now.Unix() >= c.Expires:
-		return c, &TokenError{Reason: ReasonExpired, Past: now.Sub(time.Unix(c.Expires, 0))}
-	}
-	return c, nil
-}
-
-// JWKS fetches: known keys are refetched once older than jwksMaxAge. An
-// unknown kid fetches at most every jwksRefetch after a fetch that worked
-// (Wakeshift publishes a key 10 minutes before it signs with it, so a kid
-// missing from a fresh JWKS isn't Wakeshift's), and jwksRetry after one
-// that failed, so one failure (say, a fresh instance's first fetch after a
-// deploy) doesn't refuse every token for a minute.
-const (
-	jwksMaxAge  = time.Hour
-	jwksRefetch = time.Minute
-	jwksRetry   = 5 * time.Second
-	jwksTimeout = 10 * time.Second
-)
-
-// key returns a Wakeshift signing key, fetching the JWKS when it's unknown
-// or stale. A failed fetch keeps the keys it had. checked reports whether
-// the keys looked in came from a fetch that worked, the last one tried: a
-// nil key with checked is a kid Wakeshift doesn't publish. The fetch runs
-// outside a.mu (which the exchange cache shares), and the request's
-// cancellation doesn't cut it short (that would count as a failed fetch).
-func (a *App) key(ctx context.Context, kid string) (k ed25519.PublicKey, checked bool) {
-	a.mu.Lock()
-	k, ok := a.jwks[kid]
-	fresh, wait := time.Since(a.jwksAt) < jwksMaxAge, time.Now().Before(a.jwksNext)
-	checked = a.jwks != nil && !a.jwksFail
-	a.mu.Unlock()
-	if ok && fresh || wait {
-		return k, checked
-	}
-	a.fetchMu.Lock() // one fetch at a time; the others wait for its result
-	defer a.fetchMu.Unlock()
-	a.mu.Lock()
-	if time.Now().Before(a.jwksNext) { // another fetch ran meanwhile
-		defer a.mu.Unlock()
-		return a.jwks[kid], a.jwks != nil && !a.jwksFail
-	}
-	a.mu.Unlock()
-	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jwksTimeout)
-	keys, err := a.fetchJWKS(fctx)
-	cancel()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	now := time.Now()
-	if err == nil && len(keys) > 0 {
-		a.jwks, a.jwksAt, a.jwksFail, a.jwksNext = keys, now, false, now.Add(jwksRefetch)
-	} else {
-		a.jwksFail, a.jwksNext = true, now.Add(jwksRetry)
-	}
-	return a.jwks[kid], a.jwks != nil && !a.jwksFail
-}
-
-func (a *App) fetchJWKS(ctx context.Context) (map[string]ed25519.PublicKey, error) {
-	req, _ := http.NewRequestWithContext(ctx, "GET", a.core()+"/oauth/jwks", nil)
-	resp, err := a.do(a.client(), req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("jwks: HTTP %d", resp.StatusCode)
-	}
-	var set struct {
-		Keys []struct{ Kid, Crv, X string }
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&set); err != nil {
-		return nil, err
-	}
-	keys := map[string]ed25519.PublicKey{}
-	for _, k := range set.Keys {
-		if b, err := base64.RawURLEncoding.DecodeString(k.X); err == nil && k.Crv == "Ed25519" && len(b) == ed25519.PublicKeySize {
-			keys[k.Kid] = b
-		}
-	}
-	return keys, nil
 }
 
 // ParseKey reads an app's Ed25519 private key: an app key from the console

@@ -30,7 +30,7 @@ import (
 // Each registered client (an install of a harness) is one guest: its own
 // workspace, with an agent named after the harness (claude-code). Sign-in
 // shows nothing: the user added the app to their agent, and that's the
-// consent (docs/headless.md).
+// consent.
 //
 // Since authorize has no user step, knowing a client_id must not be enough
 // to become its guest (client_ids travel in authorize URLs, which end up in

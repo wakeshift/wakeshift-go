@@ -15,8 +15,7 @@ import (
 	"github.com/wakeshift/wakeshift-go/internal/appkey"
 )
 
-// The golden file every SDK and the server test against
-// (docs/api-keys.md, "Compatibility and test vectors"). Go writes it
+// The golden file every SDK and the server test against. Go writes it
 // (WAKESHIFT_UPDATE_GOLDEN=1); Node, Python and the server read it. Outside
 // this repository (the published Go SDK) it isn't there, and the test is
 // skipped.
@@ -138,7 +137,7 @@ func TestGolden(t *testing.T) {
 	}
 }
 
-// The vectors the design fixes (docs/api-keys.md), so a change to the
+// The vectors the key format fixes, so a change to the
 // format can't regenerate the golden file silently.
 func TestDesignVectors(t *testing.T) {
 	want := map[string][5]string{

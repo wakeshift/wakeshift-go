@@ -2,8 +2,10 @@
 
 Build apps that wake AI agents. Your app is an MCP server that offers events; agents (Claude Code, Codex, ChatGPT, Cursor and others) subscribe to them, and when your app emits one, [Wakeshift](https://wakeshift.ai) wakes every subscribed conversation, in whatever harness it runs.
 
+Go 1.27 or later.
+
 ```sh
-go get github.com/wakeshift/wakeshift-go
+go get github.com/wakeshift/wakeshift-go@latest
 ```
 
 ```go
@@ -40,15 +42,19 @@ msg, err := appkit.DefineEvent(app, "chat.message", appkit.EventDef[channelArgs,
 })
 ```
 
-Publish your manifest (it carries the events) and serve them on your MCP endpoint, after its authentication:
+Publish your manifest (it carries the events), attach Wakeshift to your MCP server, and put it in front of the endpoint, after its authentication:
 
 ```go
 app.PublishManifest(ctx, appkit.Manifest{Description: "Team chat"})
-events := app.ServeEvents(srv, appkit.EventsOptions{User: func(ti *auth.TokenInfo) string { return ti.UserID }})
-mux.Handle("/mcp", requireAuth(events(mcpHandler)))
+attached := app.Attach(srv, appkit.AttachOptions{
+	Identify: func(_ context.Context, ti *auth.TokenInfo) (appkit.Identity, error) {
+		return appkit.Identity{User: ti.UserID}, nil
+	},
+})
+mux.Handle("/mcp", requireAuth(attached.Wrap(mcpHandler)))
 ```
 
-Every client can now subscribe: ChatGPT with MCP Events, every other agent with the `subscribe_events` tool that `ServeEvents` adds, and anyone can see and stop theirs with `list_subscriptions` and `unsubscribe_events`. When something happens, emit it:
+Every client can now subscribe: ChatGPT with MCP Events, every other agent with the `subscribe_events` tool that `Attach` adds, and anyone can see and stop theirs with `list_subscriptions` and `unsubscribe_events`. When something happens, emit it:
 
 ```go
 msg.Emit(ctx, channelArgs{Channel: "eng"}, message{From: "ada", Text: "shipped it"})
@@ -92,7 +98,7 @@ Every subscribed conversation wakes with the event, framed as information from o
 
 ## Sign-in
 
-Your app chooses how its users sign in:
+Your app identifies its own users; Wakeshift never signs them in for you. Choose how:
 
 - **Your own accounts:** pass your user's ID as `user` in `Args.Call`, and Wakeshift keeps a record per user for your app. Users never see Wakeshift.
 - **Guests, no sign-up:** `appkit.GuestAuth` signs MCP clients in to your app with nothing to click. Its routes serve the sign-in endpoints and the metadata that points MCP clients at them; check tokens with `Verify`:
@@ -104,13 +110,15 @@ Your app chooses how its users sign in:
   // g.Workspace and g.Agent are the guest's.
   ```
 
-- **Wakeshift accounts:** `app.Verify` checks an access token from Sign in with Wakeshift; `Exchange` acts for that user's agent within their consent.
-
 ## Examples
 
 [wakeshift/apps](https://github.com/wakeshift/apps) has complete apps built on this SDK: multiplayer games for agents (Secret Agent, Nightfall), a chat app (Agent Chat) and a Slack bridge (Slackline).
 
-The TypeScript SDK is [wakeshift/wakeshift-node](https://github.com/wakeshift/wakeshift-node), with the same calls.
+The same calls are in the [TypeScript](https://github.com/wakeshift/wakeshift-node) and [Python](https://github.com/wakeshift/wakeshift-python) SDKs. What changed between releases is in [CHANGELOG](CHANGELOG.md).
+
+## Documentation
+
+The guides and the full reference are at [wakeshift.ai/docs](https://wakeshift.ai/docs): the [quickstart](https://wakeshift.ai/docs/quickstart), [events](https://wakeshift.ai/docs/events), [your users](https://wakeshift.ai/docs/users) and [the Go SDK](https://wakeshift.ai/docs/go). The package's reference is on [pkg.go.dev](https://pkg.go.dev/github.com/wakeshift/wakeshift-go/appkit).
 
 ## Testing
 
@@ -120,9 +128,9 @@ go test ./...
 
 The SDK's end-to-end tests run against the Wakeshift server, so they run in Wakeshift's own repository.
 
-## Where changes happen
+## Contributing and security
 
-This repository is generated from Wakeshift's main repository. Pull requests are welcome: we apply them there and publish the result. Each commit here says which commit it came from (`.source-commit`); see [CONTRIBUTING](CONTRIBUTING.md).
+This repository is generated from Wakeshift's main repository. Pull requests are welcome: we apply them there and publish the result. Each commit here says which commit it came from (`.source-commit`); see [CONTRIBUTING](CONTRIBUTING.md). Report a security problem privately to support@wakeshift.ai, not in an issue ([SECURITY](SECURITY.md)).
 
 ## License
 

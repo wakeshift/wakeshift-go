@@ -23,12 +23,12 @@ type roomPost struct {
 	Body string `json:"body"`
 }
 
-// ServeEvents in front of a real MCP server (the Go SDK, stateless): the
+// Attach in front of a real MCP server (the Go SDK, stateless): the
 // capability is added to what the server answers, in JSON or SSE;
 // events/list lists the app's event types (and no wakeshift.message);
 // tools/list has the event tools, without subscribe_events for a client
 // that subscribes natively; everything else passes through.
-func TestServeEventsMiddleware(t *testing.T) {
+func TestAttachWrap(t *testing.T) {
 	for _, jsonResponse := range []bool{false, true} {
 		app := &appkit.App{ID: "t"}
 		if _, err := appkit.DefineEvent(app, "room.post", appkit.EventDef[roomArgs, roomPost]{Description: "A post to a room.", Text: func(p roomPost, _ roomArgs) string { return p.Body }}); err != nil {
@@ -38,9 +38,9 @@ func TestServeEventsMiddleware(t *testing.T) {
 		mcp.AddTool(srv, &mcp.Tool{Name: "ping"}, func(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
 			return &mcp.CallToolResult{}, nil, nil
 		})
-		events := app.ServeEvents(srv, appkit.EventsOptions{})
+		attached := app.Attach(srv, appkit.AttachOptions{})
 		h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: jsonResponse})
-		hs := httptest.NewServer(events(h))
+		hs := httptest.NewServer(attached.Wrap(h))
 		defer hs.Close()
 
 		post := func(ua, method string, params any) string {

@@ -314,20 +314,43 @@ type Watched struct {
 }
 
 // Watch records that one of the agent's sessions wants to be woken and, for
-// a harness conversation, returns a beacon for its connector.
+// a harness conversation, returns a beacon for its connector. Prefer
+// WatchFor, which names the tool whose result carries the beacon.
 func (ag *Agent) Watch(ctx context.Context, session string) (Watched, error) {
+	return ag.WatchFor(ctx, session, "")
+}
+
+// WatchFor is Watch for a beacon in the result of tool (the tool being
+// called: req.Params.Name). Wakeshift's hooks act on a beacon only from the
+// result of the tool it names, so put it in that tool's result.
+func (ag *Agent) WatchFor(ctx context.Context, session, tool string) (Watched, error) {
 	var out Watched
-	err := ag.call(ctx, "POST", "/api/apps/v1/agent/sessions/"+url.PathEscape(session)+"/watch", nil, &out)
+	err := ag.call(ctx, "POST", "/api/apps/v1/agent/sessions/"+url.PathEscape(session)+"/watch", beaconBody(tool), &out)
 	return out, err
 }
 
 // Beacon returns a fresh beacon for a harness conversation's session: add it
 // to results while the session is watching and its connector isn't
-// connected, so the connector starts again by itself.
+// connected, so the connector starts again by itself. Prefer BeaconFor,
+// which names the tool whose result carries it.
 func (ag *Agent) Beacon(ctx context.Context, session string) (Watched, error) {
+	return ag.BeaconFor(ctx, session, "")
+}
+
+// BeaconFor is Beacon for the result of tool (the tool being called:
+// req.Params.Name), as WatchFor.
+func (ag *Agent) BeaconFor(ctx context.Context, session, tool string) (Watched, error) {
 	var out Watched
-	err := ag.call(ctx, "POST", "/api/apps/v1/agent/sessions/"+url.PathEscape(session)+"/beacon", nil, &out)
+	err := ag.call(ctx, "POST", "/api/apps/v1/agent/sessions/"+url.PathEscape(session)+"/beacon", beaconBody(tool), &out)
 	return out, err
+}
+
+// beaconBody names the tool a beacon is for (nil: none).
+func beaconBody(tool string) any {
+	if tool == "" {
+		return nil
+	}
+	return map[string]string{"tool": tool}
 }
 
 // Unwatch stops one of the agent's sessions being woken: its stream links

@@ -81,7 +81,8 @@ type EventDef[A, P any] struct {
 	// Wakeshift's (P is GroupMessage), there's no Emit or PublishURL (posts
 	// come from the group), Text isn't needed, and subscribe_events refuses
 	// it: a bridged conversation's membership already wakes it. An error
-	// refuses the subscription, as Authorize does.
+	// refuses the subscription, as Authorize does. Optional arguments make
+	// no default filter (a group's event has none): they're Group's to read.
 	Group func(ctx context.Context, s Subscriber, args A) (string, error)
 
 	// ArgsSchema and PayloadSchema, if set, are the JSON Schemas used
@@ -233,7 +234,7 @@ func DefineEvent[A, P any](app *App, name string, def EventDef[A, P]) (*DefinedE
 	}
 	slices.Sort(t.argNames)
 	if t.topic == "" {
-		if t.topic, t.filter, err = defaultRoute(name, args, payload); err != nil {
+		if t.topic, t.filter, err = defaultRoute(name, args, payload, def.Group != nil); err != nil {
 			return nil, fmt.Errorf("appkit: event %s: %w", name, err)
 		}
 	} else if err := checkRoute(t.topic, t.filter, args, payload); err != nil {
@@ -570,6 +571,14 @@ func normalize(s map[string]any) {
 	if items, ok := s["items"].(map[string]any); ok {
 		normalize(items)
 	}
+	for _, k := range []string{"anyOf", "oneOf", "allOf"} {
+		branches, _ := s[k].([]any)
+		for _, b := range branches {
+			if bs, ok := b.(map[string]any); ok {
+				normalize(bs)
+			}
+		}
+	}
 }
 
 // open drops the "additionalProperties": false jsonschema.For gives every
@@ -674,8 +683,10 @@ func checkRoute(topic string, filter map[string]string, args, payload json.RawMe
 
 // defaultRoute is an event type's topic and filter when it names none: a
 // topic segment per required scalar argument, in name order, and a filter
-// on the payload's same-named field for each optional one.
-func defaultRoute(name string, args, payload json.RawMessage) (string, map[string]string, error) {
+// on the payload's same-named field for each optional one. A group's event
+// has no filter (the membership's wake filters it, and Wakeshift refuses
+// one): its optional arguments are for Group alone.
+func defaultRoute(name string, args, payload json.RawMessage, group bool) (string, map[string]string, error) {
 	var a, p struct {
 		Properties map[string]struct {
 			Type any `json:"type"`
@@ -702,6 +713,9 @@ func defaultRoute(name string, args, payload json.RawMessage) (string, map[strin
 				return "", nil, fmt.Errorf("argument %q is required, so it names a topic: it must be a string, integer or boolean (or set Topic)", n)
 			}
 			topic += "/{" + n + "}"
+			continue
+		}
+		if group {
 			continue
 		}
 		switch a.Properties[n].Type {

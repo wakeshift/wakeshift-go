@@ -12,10 +12,10 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/auth"
 )
 
-// TokenError is why a bearer token was refused (App.Verify's and
-// GuestAuth.Verify's errors are one). It unwraps to auth.ErrInvalidToken,
-// so a verifier for the MCP SDK's middleware or RequireBearer can return it
-// as it is.
+// TokenError is why a bearer token was refused: an app's verifier returns
+// one for a token it refuses. It unwraps to auth.ErrInvalidToken, so a
+// verifier for the MCP SDK's middleware or RequireBearer can return it as
+// it is.
 type TokenError struct {
 	Reason string        // one of the Reason constants
 	Past   time.Duration // for ReasonExpired: how long past its expiry it was
@@ -58,7 +58,7 @@ func (e *TokenError) Unwrap() error { return auth.ErrInvalidToken }
 // tells clients to refresh rather than sign in again, with a generic
 // description.
 func challenge(w http.ResponseWriter, metadataURL string, refused error) {
-	h, msg := fmt.Sprintf(`Bearer resource_metadata=%q`, metadataURL), "sign in with Wakeshift"
+	h, msg := fmt.Sprintf(`Bearer resource_metadata=%q`, metadataURL), "sign in"
 	if refused != nil {
 		msg = "token not valid"
 		var te *TokenError

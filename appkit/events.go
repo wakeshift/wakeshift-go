@@ -25,7 +25,7 @@ type Identity struct {
 	// subscriptions belong to them, a personal event's subscriptions need
 	// one, and list_subscriptions lists theirs.
 	User string
-	// Agent is the app's agent behind the request (ActAs, for a guest's
+	// Agent is the app's agent behind the request (ActAs, for the user's
 	// workspace and agent), if any: a native subscription to a group's
 	// event (EventDef.Group) then lives in that workspace, beside the
 	// agent's memberships, and the user is Agent.User(); every other
@@ -37,8 +37,9 @@ type Identity struct {
 type AttachOptions struct {
 	// Identify tells who's behind a request, from the endpoint's
 	// authentication (it isn't called for a request with none). An error
-	// counts as no user. Guest sign-in: the TokenInfo's UserID, and the
-	// agent from ActAs for an app with group events.
+	// counts as no user. Typically the app's own ID for the user its token
+	// names (the TokenInfo's UserID), and the agent from ActAs for an app
+	// with group events. Nil: no request has a user.
 	Identify func(context.Context, *auth.TokenInfo) (Identity, error)
 }
 
@@ -369,6 +370,8 @@ func rpcErrorOf(err error, codes event.Codes) (code int, msg string, data any) {
 		return codes.NotFound, e.Message, map[string]string{"kind": "event"}
 	case "unsupported":
 		return codes.Unsupported, e.Message, map[string]string{"feature": "deliveryMode"}
+	case "subscription_limit":
+		return codes.ResourceExhausted, e.Message, map[string]string{"kind": "subscriptions"}
 	case "bad_request", "bad_arguments":
 		return event.InvalidParams, e.Message, nil
 	case "unknown_session", "other_client", "unknown_conversation":

@@ -3,8 +3,6 @@ package appkit
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -61,22 +59,20 @@ func refusal(t *testing.T, l *logs) map[string]any {
 	return found[0]
 }
 
-// Guest tokens: no token gets the plain challenge; a bad or expired one
-// gets invalid_token, logged with why.
-func TestRequireBearerGuestTokens(t *testing.T) {
-	_, key, _ := ed25519.GenerateKey(rand.Reader)
-	g := &GuestAuth{App: &App{Key: key, MCPURL: "https://app.example/mcp"}}
+// An app's own tokens: no token gets the plain challenge; a bad or expired
+// one (its verifier's TokenError) gets invalid_token, logged with why.
+func TestRequireBearerAppTokens(t *testing.T) {
 	verify := func(_ context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
-		gu, err := g.Verify(token)
-		if err != nil {
-			return nil, err
+		switch token {
+		case "tok-good-3c9e":
+			return &auth.TokenInfo{UserID: "player-1", Expiration: time.Now().Add(time.Hour)}, nil
+		case "tok-old-8b1d":
+			return nil, &TokenError{Reason: ReasonExpired, Past: 5 * time.Second}
 		}
-		return &auth.TokenInfo{UserID: gu.Workspace + "/" + gu.Agent, Expiration: gu.Expires}, nil
+		return nil, &TokenError{Reason: ReasonInvalid}
 	}
 	h := RequireBearer(verify, testMeta)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	expired := g.sign("access", guestToken{Workspace: "ws-abc", Agent: "codex", Client: "Codex", Expires: time.Now().Add(-5 * time.Second).Unix()})
-	forged := g.sign("refresh", guestToken{Workspace: "ws-abc", Agent: "codex", Expires: time.Now().Add(time.Hour).Unix()})
-	good := g.sign("access", guestToken{Workspace: "ws-abc", Agent: "codex", Expires: time.Now().Add(time.Hour).Unix()})
+	expired, forged, good := "tok-old-8b1d", "tok-forged-51aa", "tok-good-3c9e"
 	cases := []struct {
 		name, auth, header, reason string
 		code                       int
@@ -108,7 +104,7 @@ func TestRequireBearerGuestTokens(t *testing.T) {
 			if m := refusal(t, l); m["reason"] != c.reason {
 				t.Fatalf("logged %v; want reason %q", m, c.reason)
 			}
-			if strings.Contains(l.String(), strings.TrimPrefix(c.auth, "Bearer ")) || strings.Contains(l.String(), "ws-abc") {
+			if strings.Contains(l.String(), strings.TrimPrefix(c.auth, "Bearer ")) {
 				t.Fatalf("the log has the token or its claims: %s", l.String())
 			}
 		})

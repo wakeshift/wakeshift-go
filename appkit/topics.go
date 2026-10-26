@@ -50,10 +50,14 @@ type Call struct {
 	// argument). It's a hint: it refines what Wakeshift recognised the call
 	// as (Grok Bot's calls are Cursor's), and never grants anything.
 	Harness string `json:"harness,omitempty"`
-	// AgentToken is, for an app whose users sign in with Wakeshift, the
-	// signed-in agent's exchanged token (Agent.Call sets it): Wakeshift
-	// takes the subscriber from it, never from User.
+	// AgentToken is the token of the agent the app acts for (ActAs;
+	// Agent.Call and Attach set it).
 	AgentToken string `json:"agent_token,omitempty"`
+	// Tool is the tool being called (CallFrom sets it from the request):
+	// a connector beacon in its result names it, and Wakeshift's hooks act
+	// on the beacon only from that tool's result. Put the Addition in the
+	// result of the tool the call was for.
+	Tool string `json:"tool,omitempty"`
 }
 
 // Recognised is what Wakeshift recognised the calling conversation's harness
@@ -120,6 +124,7 @@ func CallFrom(req *mcp.CallToolRequest, user, session string) Call {
 	}
 	if req.Params != nil {
 		c.Meta = req.Params.GetMeta()
+		c.Tool = req.Params.Name
 	}
 	if req.Extra != nil && req.Extra.Header != nil {
 		c.UserAgent = req.Extra.Header.Get("User-Agent")

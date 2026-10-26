@@ -57,7 +57,9 @@ func ConnectorBeacons(agent func(ctx context.Context, req *mcp.CallToolRequest) 
 			if !st.want {
 				return res, err
 			}
-			w, berr := ag.Beacon(ctx, st.handle)
+			// Named for the tool whose result it goes in: the hook takes it
+			// only from that tool's result.
+			w, berr := ag.BeaconFor(ctx, st.handle, call.Params.Name)
 			if berr != nil || w.Beacon == "" {
 				return res, err
 			}

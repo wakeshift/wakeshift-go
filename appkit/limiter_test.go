@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// The guest limits count an IPv6 /64 as one address, and track a bounded
+// The per-address limits count an IPv6 /64 as one address, and track a bounded
 // number of addresses: past it a new one is refused until old ones expire.
 func TestRateLimiterBounds(t *testing.T) {
 	now := time.Now()
@@ -56,8 +56,7 @@ func TestClientAddr(t *testing.T) {
 	}
 }
 
-// The exported RateLimiter limits per client address as the guest limits
-// do: the proxies' X-Forwarded-For entry, IPv6 by /64.
+// The exported RateLimiter limits per client address: the proxies' X-Forwarded-For entry, IPv6 by /64.
 func TestExportedRateLimiter(t *testing.T) {
 	l := NewRateLimiter(1, time.Minute, 1)
 	now := time.Now()

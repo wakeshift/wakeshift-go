@@ -98,17 +98,7 @@ Every subscribed conversation wakes with the event, framed as information from o
 
 ## Sign-in
 
-Your app identifies its own users; Wakeshift never signs them in for you. Choose how:
-
-- **Your own accounts:** pass your user's ID as `user` in `Args.Call`, and Wakeshift keeps a record per user for your app. Users never see Wakeshift.
-- **Guests, no sign-up:** `appkit.GuestAuth` signs MCP clients in to your app with nothing to click. Its routes serve the sign-in endpoints and the metadata that points MCP clients at them; check tokens with `Verify`:
-
-  ```go
-  guests := &appkit.GuestAuth{App: app}
-  guests.Routes(mux)
-  // In your MCP handler's auth: g, err := guests.Verify(bearerToken)
-  // g.Workspace and g.Agent are the guest's.
-  ```
+Your app identifies its own users, with its own sign-in; Wakeshift never signs them in for you. Pass your user's ID as `user` in `Args.Call`, or from `AttachOptions.Identify`, and Wakeshift keeps a record per user for your app. Users never see Wakeshift. To act for a user's agent, `Workspace` and `AddAgent` set it up, `ActAs` acts for it, and `HarnessAgent` names the agent after its MCP client (`claude-code`). `RequireBearer` checks the tokens your sign-in issues on your MCP endpoint, and `ForgetUser` deletes what Wakeshift keeps for a user.
 
 ## Examples
 

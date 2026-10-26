@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.3.0 (2026-10-26)
+
+### Breaking: guest sign-in is removed
+
+`GuestAuth` and `Guest` are gone: your app signs its own users in, with its own sign-in, and tells Wakeshift who they are (`Args.Call`'s `user`, or `AttachOptions.Identify`). Apps on v0.2 that use `GuestAuth` must replace it with their own sign-in before upgrading. Unchanged: `Workspace`, `AddAgent`, `ActAs`, `HarnessAgent`, `RequireBearer`, `TokenError`, `RateLimiter`, `ForgetUser`, topics, groups and events.
+
+Wakeshift also no longer forgets an app's idle users by their ID's `guest:` prefix: an app forgets the users it no longer needs with `ForgetUser`. Workspaces made by v0.2's `GuestAuth` are still forgotten once unused for 31 days.
+
+### Added
+
+- `Call.Tool`: the name of the tool being called, which `CallFrom` and `Args.Call` set from the request. The connector beacon Wakeshift adds to a result names that tool, and Wakeshift's hooks act on it only from that tool's result, so apply an `Addition` to the result of the tool its call came from.
+- `Agent.WatchFor` and `Agent.BeaconFor`: `Watch` and `Beacon` for the result of a named tool (`req.Params.Name`). `ConnectorBeacons` names the tool whose result it adds a beacon to.
+
+### Changed
+
+- An app's user has at most 20 live MCP Events webhook subscriptions. Wakeshift refuses one more with `403 subscription_limit`, which `Attach` answers with MCP Events' `ResourceExhausted` (`InvalidParams` for ChatGPT), with data `{"kind": "subscriptions"}`.
+
 ## v0.2.0 (2026-10-26)
 
 ### Breaking: Sign in with Wakeshift for apps is removed

@@ -1,17 +1,17 @@
-// Package appkit is the SDK for apps built on Wakeshift (Agent Chat,
-// Sources, and anyone else's).
+// Package appkit is the SDK for apps built on Wakeshift (Agent Chat, the
+// games, and anyone else's).
 //
 // An app has an ID and an Ed25519 key registered with Wakeshift (an app key
 // from the console, wst_…; Open finds the app it belongs to). With them it:
 //   - publishes its manifest (what it may do) and proves who it is with
 //     short-lived signed assertions;
-//   - runs its own MCP server whose clients sign in with Wakeshift: appkit
-//     serves the protected-resource metadata that points them there, and
-//     verifies the access tokens they send;
-//   - acts for an agent by exchanging the agent's token (Exchange), then
-//     declares event types, subscribes, posts, reads history and hands out
-//     stream links, all inside the agent's consent;
-//   - publishes a source's events into a workspace the user connected.
+//   - identifies its own users, with its own sign-in, in workspaces it owns
+//     (Workspace, AddAgent); RequireBearer checks the tokens MCP clients
+//     send;
+//   - defines events (DefineEvent) and attaches them to its MCP server
+//     (Attach), so an agent that subscribes wakes when the app emits one;
+//   - acts for a user's agent (ActAs): subscribes, posts, reads history and
+//     hands out stream links, inside the grant the app's manifest asks for.
 //
 // Its topics calls (Subscribe, Publish, Send, …) are the TypeScript SDK's
 // (@wakeshift/sdk), with one name that differs: Annotate returns the
@@ -163,7 +163,7 @@ func (a *App) appCall(ctx context.Context, method, path string, body, out any) e
 // Manifest is what the app may do (see the core's apps.Manifest).
 type Manifest struct {
 	Description string `json:"description"`
-	// The app identifies its own users (GuestAuth, or its own sign-in) and
+	// The app identifies its own users (with its own sign-in) and
 	// acts for their agents in workspaces Wakeshift keeps for them
 	// (App.Workspace, AddAgent, ActAs).
 	Agent *AgentScope `json:"agent,omitempty"`

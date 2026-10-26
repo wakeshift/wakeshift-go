@@ -87,6 +87,20 @@ type sampleTurn struct {
 	Hand   []string `json:"hand,omitempty" jsonschema:"Your hole cards"`
 }
 
+// sampleRunArgs and sampleRun are defined out of alphabetical order, so
+// the files catch an SDK that lists arguments (or required fields) in
+// definition order instead of name order.
+type sampleRunArgs struct {
+	Repo   string `json:"repo" jsonschema:"The repository"`
+	PR     int    `json:"pr" jsonschema:"The pull request"`
+	Branch string `json:"branch,omitempty" jsonschema:"Only runs on this branch"`
+}
+
+type sampleRun struct {
+	Status string `json:"status" jsonschema:"How it ended"`
+	Branch string `json:"branch" jsonschema:"The branch it ran on"`
+}
+
 func sampleApp(t *testing.T) *App {
 	t.Helper()
 	app := &App{ID: "sample"}
@@ -98,6 +112,11 @@ func sampleApp(t *testing.T) *App {
 	if _, err := DefineEvent(app, "game.turn", EventDef[sampleTurnArgs, sampleTurn]{
 		Description: "It's your move at a table.", Personal: true,
 		Text: func(tu sampleTurn, a sampleTurnArgs) string { return "Your move at " + a.Table }}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DefineEvent(app, "ci.run", EventDef[sampleRunArgs, sampleRun]{
+		Description: "A CI run on a pull request finished.",
+		Text:        func(r sampleRun, a sampleRunArgs) string { return "CI " + r.Status }}); err != nil {
 		t.Fatal(err)
 	}
 	return app

@@ -14,10 +14,12 @@ import (
 const Revision = "SEP-3415 (2026-10-16)"
 
 // Capability keys: the draft's extension, and the top-level key the
-// earlier sketch had, which ChatGPT still reads. A server advertises both.
+// earlier sketch had, which ChatGPT still reads. A server advertises both;
+// a client is read only for the extension (ChatGPT, which declares
+// neither, is known by its name).
 const (
 	ExtensionKey = "io.modelcontextprotocol/events"
-	LegacyKey    = "events"
+	TopLevelKey  = "events"
 )
 
 // ResultType is on every events/* result.

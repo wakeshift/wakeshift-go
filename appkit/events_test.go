@@ -79,6 +79,11 @@ func TestAttachWrap(t *testing.T) {
 		if !strings.Contains(tools, "room.post(room): A post to a room.") {
 			t.Fatalf("subscribe_events' description lists the events: %s", tools)
 		}
+		// list_subscriptions only reads, and says so; the others don't.
+		if i := strings.Index(tools, `"name":"list_subscriptions"`); i < 0 || !strings.Contains(toolJSON(tools, "list_subscriptions"), `"readOnlyHint":true`) ||
+			strings.Contains(toolJSON(tools, "subscribe_events"), `"readOnlyHint":true`) || strings.Contains(toolJSON(tools, "unsubscribe_events"), `"readOnlyHint":true`) {
+			t.Fatalf("json=%v readOnlyHint: %s", jsonResponse, tools)
+		}
 		native := []string{
 			post("openai-mcp/1.0.0", "tools/list", map[string]any{}),
 			post("t", "tools/list", map[string]any{"_meta": map[string]any{"io.modelcontextprotocol/clientCapabilities": map[string]any{
@@ -149,15 +154,29 @@ func TestDefineEvent(t *testing.T) {
 	}
 	// A custom route is checked too.
 	for name, d := range map[string]appkit.EventDef[args, payload]{
-		"ci.optional-topic": {Topic: "ci/{branch}"},                                              // optional argument in the topic
-		"ci.nope-topic":     {Topic: "ci/{nope}"},                                                // not an argument
-		"ci.case-topic":     {Topic: "ci/{Repo}"},                                                // not a valid argument name
-		"ci.bad-filter":     {Topic: "ci/{repo}", Filter: map[string]string{"nope": "{branch}"}}, // not a payload field
-		"ci.bad-value":      {Topic: "ci/{repo}", Filter: map[string]string{"branch": "{nope}"}}, // not an argument
+		"ci.optional-topic":     {Topic: "ci/{branch}"},                                              // optional argument in the topic
+		"ci.nope-topic":         {Topic: "ci/{nope}"},                                                // not an argument
+		"ci.case-topic":         {Topic: "ci/{Repo}"},                                                // not a valid argument name
+		"ci.bad-filter":         {Topic: "ci/{repo}", Filter: map[string]string{"nope": "{branch}"}}, // not a payload field
+		"ci.bad-value":          {Topic: "ci/{repo}", Filter: map[string]string{"branch": "{nope}"}}, // not an argument
+		"ci.bad-filter-default": {Filter: map[string]string{"nope": "{branch}"}},                     // the default topic's Filter: not a payload field
+		"ci.bad-value-default":  {Filter: map[string]string{"status": "{nope}"}},                     // the default topic's Filter: not an argument
 	} {
 		if _, err := appkit.DefineEvent(app, name, def(d)); err == nil {
 			t.Errorf("%s: a bad route was accepted", name)
 		}
+	}
+	// A Filter on the field an optional argument already filters is refused,
+	// naming the field, whatever its value: neither may quietly win.
+	for _, tmpl := range []string{"{repo}", "{branch}"} {
+		if _, err := appkit.DefineEvent(app, "ci.conflict", def(appkit.EventDef[args, payload]{Filter: map[string]string{"branch": tmpl}})); err == nil ||
+			!strings.Contains(err.Error(), `Filter on "branch" conflicts with optional argument "branch"`) {
+			t.Errorf("a Filter on branch (%s) with the default route: %v", tmpl, err)
+		}
+	}
+	// With a Topic there's no default filter, so the same Filter is the app's own.
+	if _, err := appkit.DefineEvent(app, "ci.own-filter", def(appkit.EventDef[args, payload]{Topic: "ci/{repo}", Filter: map[string]string{"branch": "{branch}"}})); err != nil {
+		t.Errorf("a Filter on branch with a Topic: %v", err)
 	}
 	// Personal events need To, and only they take it.
 	shared, _ := appkit.DefineEvent(app, "ci.shared", def(appkit.EventDef[args, payload]{}))
@@ -188,44 +207,35 @@ func TestDefineEvent(t *testing.T) {
 	}
 }
 
-// A group's event (EventDef.Group) carries GroupMessage, needs no Text,
-// can't be personal or deleted on delivery, and has no Emit, PublishURL or
-// Subscribe: posts come from the group, and a conversation's membership
-// wakes it.
-func TestDefineGroupEvent(t *testing.T) {
-	type roomArgs struct {
-		Room string `json:"room"`
+// toolJSON is one tool's object in a tools/list answer (as JSON text).
+func toolJSON(list, name string) string {
+	var r struct {
+		Result struct {
+			Tools []json.RawMessage `json:"tools"`
+		} `json:"result"`
 	}
-	type other struct {
-		Text string `json:"text"`
-	}
-	app := &appkit.App{ID: "rooms"}
-	group := func(_ context.Context, _ appkit.Subscriber, a roomArgs) (string, error) {
-		return "app.rooms.room." + a.Room, nil
-	}
-	ev, err := appkit.DefineEvent(app, "room.message", appkit.EventDef[roomArgs, appkit.GroupMessage]{Description: "Posts in a room.", Group: group})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := appkit.DefineEvent(app, "room.other", appkit.EventDef[roomArgs, other]{Description: "x",
-		Group: func(context.Context, appkit.Subscriber, roomArgs) (string, error) { return "", nil }}); err == nil {
-		t.Error("a group's event with its own payload was accepted")
-	}
-	for name, d := range map[string]appkit.EventDef[roomArgs, appkit.GroupMessage]{
-		"room.personal": {Description: "x", Group: group, Personal: true},
-		"room.deleted":  {Description: "x", Group: group, DeleteOnDelivery: true},
-	} {
-		if _, err := appkit.DefineEvent(app, name, d); err == nil {
-			t.Errorf("%s: accepted", name)
+	for _, line := range strings.Split(list, "\n") {
+		line = strings.TrimPrefix(strings.TrimSpace(line), "data: ")
+		if json.Unmarshal([]byte(line), &r) == nil && len(r.Result.Tools) > 0 {
+			break
 		}
 	}
-	if _, err := ev.Emit(context.Background(), roomArgs{Room: "a"}, appkit.GroupMessage{Subject: "x"}); err == nil {
-		t.Error("emitted a group's event")
+	for _, t := range r.Result.Tools {
+		var n struct{ Name string }
+		if json.Unmarshal(t, &n) == nil && n.Name == name {
+			return string(t)
+		}
 	}
-	if _, err := ev.PublishURL(context.Background(), roomArgs{Room: "a"}); err == nil {
-		t.Error("made a publish URL for a group's event")
-	}
-	if _, err := ev.Subscribe(context.Background(), appkit.Call{}, roomArgs{Room: "a"}); err == nil {
-		t.Error("subscribed a conversation to a group's event")
-	}
+	return ""
+}
+
+// Attach with no event defined refuses, as the TypeScript and Python SDKs'
+// attach do: it would serve nothing.
+func TestAttachNeedsAnEvent(t *testing.T) {
+	defer func() {
+		if r, _ := recover().(string); !strings.Contains(r, "at least one event") {
+			t.Fatalf("Attach with no events: %q", r)
+		}
+	}()
+	(&appkit.App{ID: "app_test"}).Attach(mcp.NewServer(&mcp.Implementation{Name: "t", Version: "1"}, nil), appkit.AttachOptions{})
 }

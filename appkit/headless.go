@@ -27,6 +27,14 @@ func (a *App) AddAgent(ctx context.Context, workspace, agent, displayName string
 	return out.Grant, err
 }
 
+// CheckAgent reports whether the agent's grant is still live: an
+// APIError no_grant once it's revoked, unknown_workspace once the user is
+// forgotten. It asks Wakeshift each time.
+func (a *App) CheckAgent(ctx context.Context, workspace, agent string) error {
+	_, err := a.actAsFresh(ctx, workspace, agent)
+	return err
+}
+
 // ActAs returns an Agent the app can act for: one of its own users' agents,
 // once its grant is live. Cached until shortly before the token expires.
 func (a *App) ActAs(ctx context.Context, workspace, agent string) (*Agent, error) {

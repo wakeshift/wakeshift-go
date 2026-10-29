@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
@@ -26,11 +27,18 @@ type Identity struct {
 	// one, and list_subscriptions lists theirs.
 	User string
 	// Agent is the app's agent behind the request (ActAs, for the user's
-	// workspace and agent), if any: a native subscription to a group's
-	// event (EventDef.Group) then lives in that workspace, beside the
-	// agent's memberships, and the user is Agent.User(); every other
-	// subscription is as without it.
+	// workspace and agent), if any: every call for the request is then the
+	// agent's, with its token, and the user is Agent.User(). A wrapped
+	// tool's subscriptions are the agent's sessions'.
 	Agent *Agent
+	// Client is the MCP client's name, for a request that doesn't carry
+	// one: a stateless server never sees initialize, so the app passes the
+	// name it knows from its own sign-in (an OAuth registration's
+	// client_name, say). Wakeshift reads it to tell which program the agent
+	// runs in, and whether the client subscribes to events itself. A name
+	// the request carries (initialize's, or its _meta's) wins. Leave it ""
+	// for a caller that must have no name.
+	Client string
 }
 
 // AttachOptions configure Attach.
@@ -39,14 +47,34 @@ type AttachOptions struct {
 	// authentication (it isn't called for a request with none). An error
 	// counts as no user. Typically the app's own ID for the user its token
 	// names (the TokenInfo's UserID), and the agent from ActAs for an app
-	// with group events. Nil: no request has a user.
+	// acting for its agents. Nil: no request has a user.
 	Identify func(context.Context, *auth.TokenInfo) (Identity, error)
+	// Tools names which of Attach's own tools it adds: SubscribeEventsTool,
+	// UnsubscribeEventsTool and ListSubscriptionsTool. Nil adds all three;
+	// an empty list adds none. Leave out unsubscribe_events or
+	// list_subscriptions only if your own tools let a person see and stop
+	// their subscriptions. Attach panics on a name that isn't one of them.
+	Tools []string
+	// Events configures the event features.
+	Events EventsOptions
+}
+
+// EventsOptions configure Attach's event features.
+type EventsOptions struct {
+	// Native, if set, is asked first whether a wrapped tool's call comes
+	// from a client that subscribes to the app's events itself
+	// (ToolCall.Native), for callers the SDK can't tell (an app's own house
+	// agents). False leaves it to the SDK's own checks.
+	Native func(ctx context.Context, req *mcp.CallToolRequest) bool
 }
 
 // Attachment is Wakeshift attached to an MCP server (Attach).
 type Attachment struct {
 	app      *App
 	identify func(context.Context, *auth.TokenInfo) Identity
+	events   EventsOptions
+	warned   sync.Map // warnOnce's keys
+	schemas  sync.Map // *mcp.Tool → its input schema, decoded (undeclared.go)
 }
 
 // Attach attaches Wakeshift to the app's MCP server: the one call that
@@ -70,8 +98,15 @@ type Attachment struct {
 //   - Every client can list its subscriptions (list_subscriptions) and stop
 //     one (unsubscribe_events): a headless app's users have no other way.
 //
-// Call it once per server, after the last DefineEvent (calling it again
-// replaces the tools, as the MCP SDK's AddTool does). Each event type's
+// AttachOptions.Tools picks which of the three tools it adds (all three by
+// default).
+//
+// Call it once per server, after the last DefineEvent (with none defined it
+// panics: it would serve nothing; calling it again replaces the tools, as
+// the MCP SDK's AddTool does), and after the server's own receiving
+// middleware: its middleware then runs last on a tool's result, so the
+// block a wrapped tool's reply gets (Events) stays last. Add wrapped tools
+// after it. Each event type's
 // Authorize runs before any subscription. The tools' wording is fixed, and
 // the TypeScript SDK's is the same (sdk/typescript/test/event-tools.json).
 // Wrap the MCP handler after the endpoint's authentication:
@@ -84,7 +119,10 @@ type Attachment struct {
 //	h := mcp.NewStreamableHTTPHandler(…, &mcp.StreamableHTTPOptions{Stateless: true})
 //	mux.Handle("/mcp", requireAuth(attached.Wrap(h)))
 func (a *App) Attach(srv *mcp.Server, opts AttachOptions) *Attachment {
-	at := &Attachment{app: a, identify: func(ctx context.Context, ti *auth.TokenInfo) Identity {
+	if len(a.events()) == 0 {
+		panic("appkit: Attach needs at least one event (DefineEvent) defined first")
+	}
+	at := &Attachment{app: a, events: opts.Events, identify: func(ctx context.Context, ti *auth.TokenInfo) Identity {
 		if ti == nil || opts.Identify == nil {
 			return Identity{}
 		}
@@ -94,10 +132,13 @@ func (a *App) Attach(srv *mcp.Server, opts AttachOptions) *Attachment {
 		}
 		return id
 	}}
-	a.addEventTools(srv, at.identify)
+	a.addEventTools(srv, at.identify, builtinTools(opts.Tools))
 	// The MCP server's own pipeline: every request Wrap passes on comes
-	// through here, the place for anything per tool call.
-	srv.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler { return next })
+	// through here. A wrapped tool's call (Events) gets its block here,
+	// after the MCP SDK has validated the output and filled
+	// structuredContent, and the subscriptions it made are rolled back here
+	// if the final result failed.
+	srv.AddReceivingMiddleware(at.middleware)
 	return at
 }
 
@@ -135,7 +176,7 @@ func (at *Attachment) Wrap(next http.Handler) http.Handler {
 			return
 		case "tools/list":
 			if nativeClient(r, req.Params) {
-				withoutTool(next, w, r, subscribeTool)
+				withoutTool(next, w, r, SubscribeEventsTool)
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -157,10 +198,11 @@ func (at *Attachment) Wrap(next http.Handler) http.Handler {
 			rpcError(w, req.ID, event.InvalidParams, "invalid params", nil)
 			return
 		}
-		call := at.identify(r.Context(), auth.TokenInfoFromContext(r.Context())).apply(Call{Meta: p.Meta, UserAgent: r.Header.Get("User-Agent")})
+		base := wireCall{Meta: p.Meta, UserAgent: r.Header.Get("User-Agent")}
 		if info, ok := p.Meta["io.modelcontextprotocol/clientInfo"].(map[string]any); ok {
-			call.Client, _ = info["name"].(string)
+			base.Client, _ = info["name"].(string)
 		}
+		call := at.identify(r.Context(), auth.TokenInfoFromContext(r.Context())).apply(base)
 		dialect := event.DialectOf(call.Client, call.UserAgent)
 		codes := event.CodesFor(dialect)
 		if h := r.Header.Get(event.NameHeader); h != "" {
@@ -200,15 +242,6 @@ func (at *Attachment) Wrap(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if req.Method == "events/subscribe" && t.group != nil {
-			args, _ := json.Marshal(p.Arguments)
-			g, gerr := t.group(r.Context(), Subscriber{User: call.User, Client: call.Client, Native: true}, args)
-			if gerr != nil || g == "" {
-				rpcError(w, req.ID, codes.Forbidden, fill("native_refused", "{event}", t.name), nil)
-				return
-			}
-			p.group = g
-		}
 		out, err := a.eventCall(r.Context(), req.Method, call, dialect, p)
 		if err != nil {
 			code, msg, data := rpcErrorOf(err, codes)
@@ -219,10 +252,14 @@ func (at *Attachment) Wrap(next http.Handler) http.Handler {
 	})
 }
 
-// apply puts the identity in a call: the user, and the agent's token
-// (whose user is the agent's) if there's an agent.
-func (id Identity) apply(call Call) Call {
+// apply puts the identity in a call: the user, the agent's token (whose
+// user is the agent's) if there's an agent, and the client's name if the
+// call has none.
+func (id Identity) apply(call wireCall) wireCall {
 	call.User = id.User
+	if call.Client == "" {
+		call.Client = id.Client
+	}
 	if id.Agent != nil {
 		call.User, call.AgentToken = id.Agent.User(), id.Agent.token
 	}
@@ -246,9 +283,6 @@ func nativeClient(r *http.Request, params json.RawMessage) bool {
 		return true
 	}
 	caps, _ := p.Meta["io.modelcontextprotocol/clientCapabilities"].(map[string]any)
-	if _, ok := caps[event.LegacyKey]; ok {
-		return true
-	}
 	ext, _ := caps["extensions"].(map[string]any)
 	_, ok := ext[event.ExtensionKey]
 	return ok
@@ -296,20 +330,18 @@ type eventParams struct {
 	Cursor   *string        `json:"cursor"`
 	MaxAgeMs *int64         `json:"maxAgeMs"`
 	Meta     map[string]any `json:"_meta"`
-	// group is a group's event's group (EventDef.Group), for Wakeshift.
-	group string
 }
 
 // errNoSubscription is an events/unsubscribe that matched nothing.
 var errNoSubscription = errors.New("no subscription matches")
 
-func (a *App) eventCall(ctx context.Context, method string, call Call, dialect string, p eventParams) (map[string]any, error) {
+func (a *App) eventCall(ctx context.Context, method string, call wireCall, dialect string, p eventParams) (map[string]any, error) {
 	body := map[string]any{"call": call, "name": p.Name, "arguments": p.Arguments, "delivery": p.Delivery, "dialect": dialect}
 	if method == "events/unsubscribe" {
 		var out struct {
 			Ended bool `json:"ended"`
 		}
-		if err := a.appCall(ctx, "POST", "/api/apps/v1/events/unsubscribe", body, &out); err != nil {
+		if err := a.eventsCall(ctx, "POST", "/api/apps/v1/events/unsubscribe", body, &out); err != nil {
 			return nil, err
 		}
 		// The draft says NotFound for a key that matches nothing; ChatGPT
@@ -328,9 +360,6 @@ func (a *App) eventCall(ctx context.Context, method string, call Call, dialect s
 	if p.MaxAgeMs != nil {
 		body["max_age_ms"] = *p.MaxAgeMs
 	}
-	if p.group != "" {
-		body["group"] = p.group
-	}
 	var out struct {
 		ID             string          `json:"id"`
 		RefreshBefore  time.Time       `json:"refresh_before"`
@@ -338,7 +367,7 @@ func (a *App) eventCall(ctx context.Context, method string, call Call, dialect s
 		Truncated      bool            `json:"truncated"`
 		DeliveryStatus json.RawMessage `json:"delivery_status"`
 	}
-	if err := a.appCall(ctx, "POST", "/api/apps/v1/events/subscribe", body, &out); err != nil {
+	if err := a.eventsCall(ctx, "POST", "/api/apps/v1/events/subscribe", body, &out); err != nil {
 		return nil, err
 	}
 	res := map[string]any{"resultType": event.ResultType, "id": out.ID, "refreshBefore": out.RefreshBefore.UTC().Format(time.RFC3339),
@@ -360,7 +389,7 @@ func rpcErrorOf(err error, codes event.Codes) (code int, msg string, data any) {
 		return codes.NotFound, "no subscription matches that event, arguments and delivery URL", map[string]string{"kind": "subscription"}
 	}
 	var e *APIError
-	if !errors.As(err, &e) {
+	if !errors.As(err, &e) || e.Code == "unreachable" {
 		return rpcInternal, "Wakeshift couldn't be reached", nil
 	}
 	switch e.Code {
@@ -443,7 +472,7 @@ func addEventsCapability(b []byte) []byte {
 		caps = map[string]any{}
 	}
 	settings := map[string]any{"listChanged": false}
-	caps[event.LegacyKey] = settings
+	caps[event.TopLevelKey] = settings
 	ext, _ := caps["extensions"].(map[string]any)
 	if ext == nil {
 		ext = map[string]any{}
@@ -456,22 +485,4 @@ func addEventsCapability(b []byte) []byte {
 		return b
 	}
 	return out
-}
-
-// SpeaksEvents reports whether a tool call comes from a client that
-// subscribes to the app's event types itself, with MCP Events (ChatGPT),
-// rather than through subscribe_events: a tool that wants the caller woken
-// (a game's join) tells such a client which event to subscribe to.
-func SpeaksEvents(req *mcp.CallToolRequest) bool {
-	if req == nil {
-		return false
-	}
-	var client, ua string
-	if info := req.ClientInfo(); info != nil {
-		client = info.Name
-	}
-	if req.Extra != nil && req.Extra.Header != nil {
-		ua = req.Extra.Header.Get("User-Agent")
-	}
-	return event.DialectOf(client, ua) == event.DialectChatGPT
 }

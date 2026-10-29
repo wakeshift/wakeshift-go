@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -41,9 +40,9 @@ type keyVectors struct {
 
 func readKeyVectors(t *testing.T) keyVectors {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("..", "..", "sdk", "typescript", "test", "app-keys.json"))
+	b, err := os.ReadFile(sharedGolden("app-keys.json"))
 	if os.IsNotExist(err) {
-		t.Skip("no TypeScript SDK here")
+		t.Skip("no shared golden files here")
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -62,27 +61,28 @@ func TestKeyVectors(t *testing.T) {
 		pubs[s.Name] = s.PublicKey
 	}
 	for _, a := range v.Accepted {
-		mode, id, key, err := appkit.ParseAppKey(a.Key)
+		key, err := appkit.ParseKey(a.Key)
 		if err != nil {
-			t.Fatalf("%q: %v", a.Key, err)
-		}
-		wantMode, wantID := "", ""
-		if a.Mode != nil {
-			wantMode, wantID = *a.Mode, *a.AppID
+			t.Fatalf("ParseKey %q: %v", a.Key, err)
 		}
 		pub := base64.RawURLEncoding.EncodeToString(key.Public().(ed25519.PublicKey))
-		if mode != wantMode || id != wantID || pub != pubs[a.Seed] {
-			t.Errorf("%q: mode %q, app %q, public key %s", a.Key, mode, id, pub)
+		if pub != pubs[a.Seed] {
+			t.Errorf("%q: public key %s", a.Key, pub)
 		}
-		if k, err := appkit.ParseKey(a.Key); err != nil || !k.Equal(key) {
-			t.Errorf("ParseKey %q: %v", a.Key, err)
+		// A key that names its app opens without asking Wakeshift (there's
+		// none at core.test).
+		if a.AppID != nil {
+			app, err := appkit.Open(context.Background(), a.Key, "https://core.test")
+			if err != nil || app.ID != *a.AppID || !app.Key.Equal(key) {
+				t.Errorf("Open %q: %+v, %v", a.Key, app, err)
+			}
 		}
 	}
 	for _, r := range v.Refused {
-		if _, _, _, err := appkit.ParseAppKey(r.Key); err == nil {
+		if _, err := appkit.ParseKey(r.Key); err == nil {
 			t.Errorf("%q (%s) parsed", r.Key, r.Why)
 		}
-		if _, err := appkit.Open(context.Background(), r.Key, "https://core.test", ""); err == nil {
+		if _, err := appkit.Open(context.Background(), r.Key, "https://core.test"); err == nil {
 			t.Errorf("Open %q (%s)", r.Key, r.Why)
 		}
 	}
@@ -128,8 +128,8 @@ func TestOpenAsksWhichApp(t *testing.T) {
 	v := readKeyVectors(t)
 	f := newFakeCore(t)
 	key := strings.TrimSpace(v.Accepted[1].Key) // S
-	app, err := appkit.Open(context.Background(), key, f.URL, "https://ci.test/mcp")
-	if err != nil || app.ID != "ci-bot" || app.Core != f.URL || app.MCPURL != "https://ci.test/mcp" {
+	app, err := appkit.Open(context.Background(), key, f.URL)
+	if err != nil || app.ID != "ci-bot" || app.Core != f.URL {
 		t.Fatalf("Open: %+v, %v", app, err)
 	}
 	kid := v.Seeds[1].KID
@@ -141,14 +141,6 @@ func TestOpenAsksWhichApp(t *testing.T) {
 	if err != nil || info.Key.Name != "Default" || f.claims["iss"] != "ci-bot" || f.header["kid"] != kid {
 		t.Fatalf("Info %+v %v: header %v, claims %v", info, err, f.header, f.claims)
 	}
-	// FromKey can't: it doesn't call Wakeshift.
-	if _, err := appkit.FromKey(key, f.URL, ""); err == nil || !strings.Contains(err.Error(), "appkit.Open") {
-		t.Fatalf("FromKey with a current key: %v", err)
-	}
-	// Load, for our own apps' deploys, takes the app it's given.
-	if app, err := appkit.Load("ci-bot", key, f.URL, ""); err != nil || app.ID != "ci-bot" {
-		t.Fatalf("Load: %+v, %v", app, err)
-	}
 }
 
 // An older key names its app: Open doesn't call Wakeshift for it, and its
@@ -156,7 +148,7 @@ func TestOpenAsksWhichApp(t *testing.T) {
 func TestOpenWithAnOldKey(t *testing.T) {
 	v := readKeyVectors(t)
 	f := newFakeCore(t)
-	app, err := appkit.Open(context.Background(), "wst_live_my-app_3q2-7__7AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", f.URL, "")
+	app, err := appkit.Open(context.Background(), "wst_live_my-app_3q2-7__7AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", f.URL)
 	if err != nil || app.ID != "my-app" || f.calls.Load() != 0 {
 		t.Fatalf("Open: %+v, %v, %d calls", app, err, f.calls.Load())
 	}
@@ -171,21 +163,21 @@ func TestOpenWithAnOldKey(t *testing.T) {
 func TestOpenDefaultCore(t *testing.T) {
 	t.Setenv("WAKESHIFT_CORE", "")
 	test := "wst_test_ci-bot_" + strings.Repeat("A", 43)
-	if _, err := appkit.Open(context.Background(), test, "", ""); err == nil || !strings.Contains(err.Error(), "WAKESHIFT_CORE") {
+	if _, err := appkit.Open(context.Background(), test, ""); err == nil || !strings.Contains(err.Error(), "WAKESHIFT_CORE") {
 		t.Fatalf("a test key without a core: %v", err)
 	}
 	live := "wst_live_my-app_3q2-7__7AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-	if app, err := appkit.Open(context.Background(), live, "", ""); err != nil || app.Core != appkit.DefaultCore {
+	if app, err := appkit.Open(context.Background(), live, ""); err != nil || app.Core != appkit.DefaultCore {
 		t.Fatalf("a live key: %+v, %v", app, err)
 	}
 	t.Setenv("WAKESHIFT_CORE", "https://app.staging.wakeshift.ai")
-	if app, err := appkit.Open(context.Background(), test, "", ""); err != nil || app.Core != "https://app.staging.wakeshift.ai" {
+	if app, err := appkit.Open(context.Background(), test, ""); err != nil || app.Core != "https://app.staging.wakeshift.ai" {
 		t.Fatalf("a test key with WAKESHIFT_CORE: %+v, %v", app, err)
 	}
 	// A current key defaults to production too: it asks there.
 	f := newFakeCore(t)
 	t.Setenv("WAKESHIFT_CORE", f.URL)
-	if app, err := appkit.Open(context.Background(), readKeyVectors(t).Accepted[0].Key, "", ""); err != nil || app.Core != f.URL || app.ID != "ci-bot" {
+	if app, err := appkit.Open(context.Background(), readKeyVectors(t).Accepted[0].Key, ""); err != nil || app.Core != f.URL || app.ID != "ci-bot" {
 		t.Fatalf("a current key with WAKESHIFT_CORE: %+v, %v", app, err)
 	}
 }
@@ -200,7 +192,7 @@ func TestOpenRefused(t *testing.T) {
 		w.Write([]byte(`{"error": {"code": "unauthenticated", "message": "invalid assertion: this key isn't one of app.wakeshift.ai's; if it came from another console, set WAKESHIFT_CORE to its address"}}`))
 	}))
 	defer hs.Close()
-	_, err := appkit.Open(context.Background(), v.Accepted[0].Key, hs.URL, "")
+	_, err := appkit.Open(context.Background(), v.Accepted[0].Key, hs.URL)
 	if !appkit.IsCode(err, "unauthenticated") || !strings.Contains(err.Error(), "WAKESHIFT_CORE") {
 		t.Fatalf("refused: %v", err)
 	}

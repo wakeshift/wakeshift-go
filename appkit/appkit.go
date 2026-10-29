@@ -10,17 +10,15 @@
 //     send;
 //   - defines events (DefineEvent) and attaches them to its MCP server
 //     (Attach), so an agent that subscribes wakes when the app emits one;
-//   - acts for a user's agent (ActAs): subscribes, posts, reads history and
-//     hands out stream links, inside the grant the app's manifest asks for.
+//   - subscribes the conversation calling one of its own tools, from a tool
+//     wrapped by Events (DefinedEvent.Subscribe), and emits to the
+//     conversations it stored (Emit with ToSubscription);
+//   - acts for a user's agent (ActAs), so a wrapped tool's subscriptions are
+//     the agent's, inside the grant the app's manifest asks for.
 //
-// Its topics calls (Subscribe, Publish, Send, …) are the TypeScript SDK's
-// (@wakeshift/sdk), with one name that differs: Annotate returns the
-// Addition, as the SDK's addition(call) does (the SDK's annotate(call,
-// result) also applies it; here that's Addition.Apply). Unlike the SDK,
-// only Open reads WAKESHIFT_CORE and defaults to DefaultCore; nothing warns
-// when Wakeshift recognised no harness in a call (read Addition.Agent); and
-// a core that doesn't answer is a plain error, not one with the code
-// unreachable.
+// Its calls are the TypeScript and Python SDKs' (@wakeshift/sdk,
+// wakeshift), in Go's shape. Unlike them, only Open reads WAKESHIFT_CORE
+// and defaults to DefaultCore.
 package appkit
 
 import (
@@ -33,9 +31,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -55,9 +53,23 @@ type App struct {
 	exchanged map[string]*Agent // ActAs's, by workspace and agent
 
 	eventTypes []*eventType // DefineEvent's, in order
+
+	// The manifest (manifest.go): what the app last gave PublishManifest
+	// (nil for nothing), and whether Wakeshift has the manifest for the
+	// event types defined now (sent at generation sentGen; DefineEvent
+	// moves gen on). sendMu makes one send at a time.
+	sendMu       sync.Mutex
+	base         *Manifest
+	gen, sentGen uint64
+	sent         bool
 }
 
-// APIError is an error response from Wakeshift.
+// APIError is an error response from Wakeshift, or a mistake the SDK
+// catches before asking it (an emit without a recipient, another app's
+// event), with the code and status Wakeshift gives for the same mistake.
+// A request that got no answer at all (a wrong core, a network problem, the
+// HTTP client's timeout) is one with Status 0 and the code unreachable,
+// which unwraps to the transport's error.
 type APIError struct {
 	Status  int
 	Code    string
@@ -65,10 +77,52 @@ type APIError struct {
 	// Reason, for some errors, is a category (an MCP Events callback that
 	// failed verification: challenge_failed, http_4xx…).
 	Reason string
+
+	err error // unreachable's cause
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("wakeshift: %s (%d): %s", e.Code, e.Status, e.Message)
+	if e.Code == "unreachable" && e.Status == 0 {
+		return "wakeshift: " + e.Message
+	}
+	code := e.Code
+	if code == "" {
+		code = "error"
+	}
+	return fmt.Sprintf("wakeshift: %s (%d): %s", code, e.Status, e.Message)
+}
+
+// Unwrap is the transport's error, for an unreachable core.
+func (e *APIError) Unwrap() error { return e.err }
+
+// unreachable is the APIError for a request with ctx through client that
+// got no answer. It names the core it went to: a wrong or missing
+// WAKESHIFT_CORE is the usual cause.
+func (a *App) unreachable(ctx context.Context, client *http.Client, err error) *APIError {
+	cause := err
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		cause = ue.Err // without the method and URL, which the message names
+	}
+	why := cause.Error()
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() && client.Timeout > 0 && ctx.Err() == nil {
+		why = fmt.Sprintf("no answer within %s", client.Timeout)
+	}
+	return &APIError{Code: "unreachable", Message: fmt.Sprintf("can't reach Wakeshift at %s (%s). "+
+		"Check that WAKESHIFT_CORE, or the core option, is the address of the console your key came from", a.core(), why), err: err}
+}
+
+// refuse is the APIError for a mistake caught before asking Wakeshift:
+// the status and code Wakeshift gives for the same mistake.
+func refuse(status int, code, format string, a ...any) *APIError {
+	return &APIError{Status: status, Code: code, Message: fmt.Sprintf(format, a...)}
+}
+
+// badArguments is Wakeshift's bad_arguments: an event's arguments,
+// payload or recipients that don't fit it.
+func badArguments(format string, a ...any) *APIError {
+	return refuse(http.StatusBadRequest, "bad_arguments", format, a...)
 }
 
 // IsCode reports whether err is an APIError with code.
@@ -125,7 +179,7 @@ func (a *App) callWith(ctx context.Context, client *http.Client, method, path, b
 	}
 	req, err := http.NewRequestWithContext(ctx, method, a.core()+path, r)
 	if err != nil {
-		return err
+		return a.unreachable(ctx, client, err) // a core address that isn't a URL
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	if body != nil {
@@ -133,20 +187,47 @@ func (a *App) callWith(ctx context.Context, client *http.Client, method, path, b
 	}
 	resp, err := a.do(client, req)
 	if err != nil {
-		return err
+		return a.unreachable(ctx, client, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		var e struct {
-			Error struct{ Code, Message, Reason string } `json:"error"`
-		}
-		json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&e)
-		return &APIError{Status: resp.StatusCode, Code: e.Error.Code, Message: e.Error.Message, Reason: e.Error.Reason}
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return errorOf(resp.StatusCode, b)
 	}
 	if out == nil {
 		return nil
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	// A 2xx that isn't Wakeshift's JSON: a proxy's page, or a wrong core.
+	if t := bytes.TrimSpace(b); len(t) == 0 || t[0] != '{' || !json.Valid(t) {
+		return &APIError{Status: resp.StatusCode, Code: "bad_response", Message: fmt.Sprintf("Wakeshift at %s answered %d without a JSON object. "+
+			"Check that WAKESHIFT_CORE, or the core option, is the address of the console your key came from", a.core(), resp.StatusCode)}
+	}
+	return json.Unmarshal(b, out)
+}
+
+// errorOf is the APIError for an answer with status that isn't a success,
+// with body (its start): Wakeshift's code, message and reason where it sent
+// them as strings, else the body's first 200 bytes as the message, else the
+// status's own text, as every SDK does (sdk/typescript/test/errors.json).
+func errorOf(status int, body []byte) *APIError {
+	var e struct {
+		Error any `json:"error"`
+	}
+	json.Unmarshal(body, &e)
+	fields, _ := e.Error.(map[string]any)
+	str := func(k string) string { s, _ := fields[k].(string); return s }
+	msg := str("message")
+	if msg == "" {
+		msg = string(body[:min(len(body), 200)])
+	}
+	if msg == "" {
+		msg = http.StatusText(status)
+	}
+	return &APIError{Status: status, Code: str("code"), Message: msg, Reason: str("reason")}
 }
 
 // appCall is call with a fresh assertion.
@@ -167,9 +248,24 @@ type Manifest struct {
 	// acts for their agents in workspaces Wakeshift keeps for them
 	// (App.Workspace, AddAgent, ActAs).
 	Agent *AgentScope `json:"agent,omitempty"`
-	// Events are the app's event types. PublishManifest adds the ones
-	// DefineEvent made; list more here only for events defined elsewhere.
+	// Events are event types defined elsewhere, not with DefineEvent: the
+	// manifest Wakeshift gets lists these, then the ones DefineEvent made.
+	// Listing one DefineEvent made is an error.
 	Events []ManifestEvent `json:"events,omitempty"`
+	// OthersCanWake: your app wakes its users' agents with what other
+	// people and their agents do there (messages, moves), so the consent
+	// screen tells the person that agents of people they don't know can
+	// wake theirs.
+	OthersCanWake bool `json:"others_can_wake,omitempty"`
+	// PreapproveTools names your MCP tools (as your server lists them)
+	// that agents' programs can run without asking each time: tools that
+	// only read, and routine ones the agent calls on every wake that reach
+	// only what it already joined. Never one that deletes, spends, or
+	// reaches people the user hasn't chosen. When a user connects Claude
+	// Code or Cursor CLI, Wakeshift offers to allow exactly these, by
+	// name, in the same question as its install. Letters, digits, _ and -;
+	// at most 20.
+	PreapproveTools []string `json:"preapprove_tools,omitempty"`
 }
 
 type AgentScope struct {
@@ -179,10 +275,7 @@ type AgentScope struct {
 	// any Seconds), on top of Wakeshift's own: 10 a second, 450 per 5 minutes
 	// and 3,600 an hour. Wake-ups past a limit wait their turn.
 	WakeLimits []WakeLimit `json:"wake_limits,omitempty"`
-	// Groups asks to add the agent to the app's groups, where agents from
-	// other people's workspaces can wake it (see CreateGroup).
-	Groups  bool `json:"groups,omitempty"`
-	TTLDays int  `json:"ttl_days"`
+	TTLDays    int         `json:"ttl_days"`
 	// StartPrompt is what the user should say to their agent once it's
 	// connected (e.g. "Join a game of Nightfall"). Wakeshift shows it after
 	// consent. At most 120 characters.
@@ -200,124 +293,12 @@ type ScopeEvent struct {
 	Description string `json:"description"`
 }
 
-// PublishManifest tells Wakeshift what the app may do, with the event
-// types DefineEvent made. An event type both defined and listed in
-// m.Events is an error: the two could differ.
-func (a *App) PublishManifest(ctx context.Context, m Manifest) error {
-	for _, t := range a.events() {
-		if slices.ContainsFunc(m.Events, func(e ManifestEvent) bool { return e.Name == t.name }) {
-			return fmt.Errorf("appkit: event %s is defined with DefineEvent and listed in Manifest.Events: keep one", t.name)
-		}
-		m.Events = append(m.Events, t.manifestEntry())
-	}
-	return a.appCall(ctx, "PUT", "/api/apps/v1/manifest", m, nil)
-}
-
-// Party is who an event is from.
-type Party struct {
-	Kind string `json:"kind"`
-	ID   string `json:"id"`
-}
-
-// ── Groups ───────────────────────────────────────────────────────────────
-
-// A group is one of the app's event types whose members are agents from
-// any workspace: a shared channel, a debate, a game. The app decides who
-// may join and post (and owns everything else about the room); Wakeshift
-// keeps the membership, copies each post to every member's workspace and
-// wakes them under their own consent. An agent joins by subscribing to the
-// group's type (needs AgentScope.Groups), and posts and reads history on it
-// as on any type, mentioning members by their group handles.
-
-// Group is one of the app's groups.
-type Group struct {
-	Type        string `json:"type"`
-	Description string `json:"description"`
-	// Data is the app's own, about the room (e.g. who owns it); at most 4
-	// KB of JSON object. Wakeshift only stores it.
-	Data      json.RawMessage `json:"data"`
-	CreatedAt time.Time       `json:"created_at"`
-	Members   []GroupMember   `json:"members"`
-}
-
-// GroupMember is a conversation in a group: one of an agent's sessions (two
-// Claude Code conversations are two members), or the agent as a whole if it
-// joined without one.
-type GroupMember struct {
-	Handle    string    `json:"handle"` // unique in the group: claude-code, claude-code-2
-	Workspace string    `json:"workspace"`
-	Agent     string    `json:"agent"`
-	Session   string    `json:"session,omitempty"` // its session's handle in its workspace (claude-code#2)
-	JoinedAt  time.Time `json:"joined_at"`
-	// Connected (in App.Group): whether something is delivering to the
-	// member now. A game can skip a player that dropped off.
-	Connected *bool `json:"connected,omitempty"`
-}
-
-// GroupPost is something the app posts to a group: as itself, or (Sender)
-// for one of its own people.
-type GroupPost struct {
-	Subject  string   `json:"subject"`
-	Body     string   `json:"body,omitempty"`
-	Data     any      `json:"data,omitempty"`
-	Mentions []string `json:"mentions,omitempty"` // group handles
-	ParentID string   `json:"parent_id,omitempty"`
-	// Sender, for a headless app's own person (posting from its site): the
-	// post is from {kind: "person", id: handle}, never a member's kind, and
-	// refused (handle_taken) if a member has the handle. It reaches every
-	// member as outside input.
-	Sender *Sender `json:"sender,omitempty"`
-}
-
-// Sender is a person the app posts for: their handle (lowercase letters,
-// digits and dashes, up to 24 characters, starting with a letter).
-type Sender struct {
-	Handle string `json:"handle"`
-}
-
-func groupPath(typ string) string { return "/api/apps/v1/groups/" + url.PathEscape(typ) }
-
-// CreateGroup creates a group (under the app's prefix, app.<id>.…), or
-// updates its description and data (nil data keeps what's there).
-func (a *App) CreateGroup(ctx context.Context, typ, description string, data any) (g Group, created bool, err error) {
-	var out struct {
-		Group   Group
-		Created bool
-	}
-	err = a.appCall(ctx, "PUT", groupPath(typ), map[string]any{"description": description, "data": data}, &out)
-	return out.Group, out.Created, err
-}
-
-// Group returns a group and its members.
-func (a *App) Group(ctx context.Context, typ string) (Group, error) {
-	var g Group
-	err := a.appCall(ctx, "GET", groupPath(typ), nil, &g)
-	return g, err
-}
-
-// RemoveMember takes a member out of a group: its subscriptions to it end.
-func (a *App) RemoveMember(ctx context.Context, typ, handle string) error {
-	return a.appCall(ctx, "DELETE", groupPath(typ)+"/members/"+url.PathEscape(handle), nil, nil)
-}
-
-// CloseGroup deletes a group: every member leaves.
-func (a *App) CloseGroup(ctx context.Context, typ string) error {
-	return a.appCall(ctx, "DELETE", groupPath(typ), nil, nil)
-}
-
-// PostToGroup posts to a group as the app (e.g. a moderator).
-func (a *App) PostToGroup(ctx context.Context, typ string, p GroupPost) (Posted, error) {
-	var out Posted
-	err := a.appCall(ctx, "POST", groupPath(typ)+"/events", p, &out)
-	return out, err
-}
-
 // ParseKey reads an app's Ed25519 private key: an app key from the console
-// (wst_…, either format, see ParseAppKey), or base64 (standard or URL) of a 32-byte
+// (wst_…, either format, see Open), or base64 (standard or URL) of a 32-byte
 // seed or a 64-byte key.
 func ParseKey(s string) (ed25519.PrivateKey, error) {
 	if strings.HasPrefix(strings.TrimSpace(s), keyPrefix) {
-		_, _, key, err := ParseAppKey(s)
+		_, key, err := parseAppKey(s)
 		return key, err
 	}
 	b, err := base64.StdEncoding.DecodeString(s)

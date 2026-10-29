@@ -18,15 +18,29 @@ import (
 // drift: event-tools.json is the event tools' fixed wording, and
 // events-list.json is what events/list and tools/list answer for the
 // sample event types below (sdk/typescript defines the same ones with
-// zod). WAKESHIFT_UPDATE_GOLDEN=1 rewrites them from this SDK. Outside
-// this repository (the published Go SDK) the files aren't there, and the
-// test is skipped.
-var goldenDir = filepath.Join("..", "..", "sdk", "typescript", "test")
+// zod). WAKESHIFT_UPDATE_GOLDEN=1 rewrites them from this SDK.
+var goldenDir = sharedGoldenDir()
+
+// sharedGoldenDir is where the golden files the three SDKs share are:
+// beside the TypeScript SDK's tests in Wakeshift's repository, or
+// testdata/golden in the published Go SDK, where opensource/export.sh copies
+// them.
+func sharedGoldenDir() string {
+	if here := filepath.Join("..", "..", "sdk", "typescript", "test"); exists(here) {
+		return here
+	}
+	return filepath.Join("testdata", "golden")
+}
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
 
 func golden(t *testing.T, name string, got any) {
 	t.Helper()
 	if _, err := os.Stat(goldenDir); err != nil {
-		t.Skip("no TypeScript SDK here")
+		t.Skip("no shared golden files here")
 	}
 	b, err := json.MarshalIndent(canonical(t, got), "", "  ")
 	if err != nil {
@@ -104,20 +118,8 @@ type sampleRun struct {
 func sampleApp(t *testing.T) *App {
 	t.Helper()
 	app := &App{ID: "sample"}
-	if _, err := DefineEvent(app, "chat.message", EventDef[sampleChatArgs, sampleChat]{
-		Title: "Chat message", Description: "A new message in a channel.",
-		Text: func(m sampleChat, _ sampleChatArgs) string { return m.From + ": " + m.Text }}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DefineEvent(app, "game.turn", EventDef[sampleTurnArgs, sampleTurn]{
-		Description: "It's your move at a table.", Personal: true,
-		Text: func(tu sampleTurn, a sampleTurnArgs) string { return "Your move at " + a.Table }}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DefineEvent(app, "ci.run", EventDef[sampleRunArgs, sampleRun]{
-		Description: "A CI run on a pull request finished.",
-		Text:        func(r sampleRun, a sampleRunArgs) string { return "CI " + r.Status }}); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"chat.message", "game.turn", "ci.run"} {
+		defineSample(t, app, name) // manifest_golden_internal_test.go
 	}
 	return app
 }
@@ -151,7 +153,11 @@ func TestEventsListGolden(t *testing.T) {
 	tools := []any{}
 	for _, tl := range result("tools/list")["tools"].([]any) {
 		m := tl.(map[string]any)
-		tools = append(tools, map[string]any{"name": m["name"], "description": m["description"], "inputSchema": inputShape(m["inputSchema"])})
+		tool := map[string]any{"name": m["name"], "description": m["description"], "inputSchema": inputShape(m["inputSchema"])}
+		if a, ok := m["annotations"].(map[string]any); ok && len(a) > 0 {
+			tool["annotations"] = a // list_subscriptions' readOnlyHint
+		}
+		tools = append(tools, tool)
 	}
 	golden(t, "events-list.json", map[string]any{"events": result("events/list")["events"], "tools": tools,
 		"manifest": app.manifestEvents()})

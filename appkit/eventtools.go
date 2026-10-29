@@ -3,7 +3,7 @@ package appkit
 // The tools Attach adds: subscribe_events (for clients that don't
 // subscribe with MCP Events themselves), unsubscribe_events and
 // list_subscriptions (for everyone). Their wording is the TypeScript SDK's
-// (sdk/typescript/src/events.ts, EVENT_TOOL_TEXT), and both SDKs check it
+// (sdk/typescript/src/events.ts, EVENT_TOOL_TEXT), and every SDK checks it
 // against sdk/typescript/test/event-tools.json (TestEventToolsGolden here).
 
 import (
@@ -18,12 +18,26 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// The tools' names.
+// The names of Attach's own tools, for AttachOptions.Tools.
 const (
-	subscribeTool   = "subscribe_events"
-	unsubscribeTool = "unsubscribe_events"
-	listTool        = "list_subscriptions"
+	SubscribeEventsTool   = "subscribe_events"
+	UnsubscribeEventsTool = "unsubscribe_events"
+	ListSubscriptionsTool = "list_subscriptions"
 )
+
+// builtinTools is which of Attach's own tools to add: tools' names, or all
+// three for nil. An unknown name is a mistake in the app, so it panics at
+// startup.
+func builtinTools(tools []string) map[string]bool {
+	out := map[string]bool{SubscribeEventsTool: tools == nil, UnsubscribeEventsTool: tools == nil, ListSubscriptionsTool: tools == nil}
+	for _, t := range tools {
+		if _, ok := out[t]; !ok {
+			panic("appkit: AttachOptions.Tools names " + strconv.Quote(t) + ": Attach's own tools are subscribe_events, unsubscribe_events and list_subscriptions")
+		}
+		out[t] = true
+	}
+	return out
+}
 
 // maxListedEvents is how many event types subscribe_events' description
 // lists.
@@ -89,18 +103,20 @@ func eventsListing(types []*eventType) string {
 	return out
 }
 
-// argsSchema is Args' schema (session_key, harness, conversation_id). Args
-// is a fixed type, so a failure is a bug in this package: it panics at
-// startup, never at a request.
+// argsSchema is WakeArgs' schema (session_key, harness, conversation_id),
+// described as a wrapped tool's are: Attach's own tools take the same
+// arguments, worded alike in all three SDKs (the shared golden file
+// events-list.json). It's a fixed type, so a failure is a bug in this
+// package: it panics at startup, never at a request.
 var argsSchema = func() *jsonschema.Schema {
-	s, err := jsonschema.For[Args](nil)
+	s, err := jsonschema.For[WakeArgs](nil)
 	if err != nil {
-		panic("appkit: Args' schema: " + err.Error())
+		panic("appkit: the tools' arguments' schema: " + err.Error())
 	}
 	return s
 }()
 
-// toolSchema is a tool's input schema: props, then Args' (session_key,
+// toolSchema is a tool's input schema: props, then WakeArgs' (session_key,
 // harness, conversation_id); required lists the required ones.
 func toolSchema(props map[string]any, required ...string) map[string]any {
 	all := map[string]any{}
@@ -140,21 +156,17 @@ func detailOf(err error) string {
 }
 
 // addEventTools adds the tools to srv.
-func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *auth.TokenInfo) Identity) {
+func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *auth.TokenInfo) Identity, tools map[string]bool) {
+	// add adds one of the tools, if the app wants it (AttachOptions.Tools).
+	add := func(t *mcp.Tool, h mcp.ToolHandler) {
+		if tools[t.Name] {
+			srv.AddTool(t, h)
+		}
+	}
 	types := a.events()
 	names := make([]string, len(types))
 	for i, t := range types {
 		names[i] = t.name
-	}
-	// A group's event isn't for subscribe_events: a bridged conversation's
-	// membership of the group wakes it already.
-	var bridged []*eventType
-	var bridgedNames []string
-	for _, t := range types {
-		if t.group == nil {
-			bridged = append(bridged, t)
-			bridgedNames = append(bridgedNames, t.name)
-		}
 	}
 	who := func(ctx context.Context, req *mcp.CallToolRequest) Identity {
 		if req.Extra == nil {
@@ -163,41 +175,35 @@ func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *aut
 		return identify(ctx, req.Extra.TokenInfo)
 	}
 	user := func(ctx context.Context, req *mcp.CallToolRequest) string {
-		return who(ctx, req).apply(Call{}).User
+		return who(ctx, req).apply(wireCall{}).User
 	}
 	// callOf is the tool call as Wakeshift takes it (with the app's agent,
 	// if Identify gives one; "" for the user if there's none).
-	callOf := func(ctx context.Context, req *mcp.CallToolRequest, args Args) Call {
-		return who(ctx, req).apply(args.Call(req, ""))
-	}
-	client := func(req *mcp.CallToolRequest) string {
-		if info := req.ClientInfo(); info != nil {
-			return info.Name
-		}
-		return ""
+	callOf := func(ctx context.Context, req *mcp.CallToolRequest, args WakeArgs) wireCall {
+		return who(ctx, req).apply(callFrom(req, "", args.SessionKey).withArgs(args))
 	}
 	argsProp := map[string]any{"type": "object", "description": eventTools["arguments_argument"]}
-	if len(bridged) > 0 {
-		srv.AddTool(&mcp.Tool{Name: subscribeTool, Description: eventTools["subscribe_description"] + eventTools["events_heading"] + eventsListing(bridged),
-			InputSchema: toolSchema(map[string]any{"event": map[string]any{"type": "string", "enum": bridgedNames, "description": eventTools["event_argument"]},
+	if len(types) > 0 {
+		add(&mcp.Tool{Name: SubscribeEventsTool, Description: eventTools["subscribe_description"] + eventTools["events_heading"] + eventsListing(types),
+			InputSchema: toolSchema(map[string]any{"event": map[string]any{"type": "string", "enum": names, "description": eventTools["event_argument"]},
 				"arguments": argsProp}, "event")},
 			func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 				var in struct {
 					Event     string          `json:"event"`
 					Arguments json.RawMessage `json:"arguments"`
-					Args
+					WakeArgs
 				}
 				json.Unmarshal(req.Params.Arguments, &in)
 				t := a.eventByName(in.Event)
-				if t == nil || t.group != nil {
+				if t == nil {
 					return textResult(fill("unknown_event", "{event}", in.Event), true), nil
 				}
 				args := t.knownJSON(json.RawMessage(compact(in.Arguments)))
-				call := callOf(ctx, req, in.Args)
+				call := callOf(ctx, req, in.WakeArgs)
 				if t.personal && call.User == "" {
 					return textResult(fill("personal_no_user", "{event}", t.name), true), nil
 				}
-				if t.authorize != nil && !t.authorize(ctx, Subscriber{User: call.User, Client: client(req)}, args) {
+				if t.authorize != nil && !t.authorize(ctx, Subscriber{User: call.User, Client: call.Client}, args) {
 					return textResult(fill("refused", "{event}", t.name), true), nil
 				}
 				var out struct {
@@ -205,19 +211,19 @@ func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *aut
 						Arguments json.RawMessage `json:"arguments"`
 						Created   bool            `json:"created"`
 					} `json:"event_subscription"`
-					Addition Addition `json:"addition"`
+					Addition addition `json:"addition"`
 				}
-				if err := a.appCall(ctx, "POST", "/api/apps/v1/event-subscriptions", map[string]any{"call": call, "name": t.name, "arguments": args}, &out); err != nil {
+				if err := a.eventsCall(ctx, "POST", "/api/apps/v1/event-subscriptions", map[string]any{"call": call, "name": t.name, "arguments": args}, &out); err != nil {
 					return textResult(fill("subscribe_failed", "{detail}", detailOf(err)), true), nil
 				}
 				key := "renewed"
 				if out.EventSubscription.Created {
 					key = "subscribed"
 				}
-				return out.Addition.Apply(&mcp.CallToolResult{}, fill(key, "{event}", t.name, "{arguments}", compact(out.EventSubscription.Arguments))), nil
+				return out.Addition.apply(&mcp.CallToolResult{}, fill(key, "{event}", t.name, "{arguments}", compact(out.EventSubscription.Arguments))), nil
 			})
 	}
-	srv.AddTool(&mcp.Tool{Name: unsubscribeTool, Description: eventTools["unsubscribe_description"],
+	add(&mcp.Tool{Name: UnsubscribeEventsTool, Description: eventTools["unsubscribe_description"],
 		InputSchema: toolSchema(map[string]any{"event": map[string]any{"type": "string", "enum": names, "description": eventTools["event_argument"]},
 			"arguments": argsProp, "id": map[string]any{"type": "string", "description": eventTools["id_argument"]}})},
 		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -225,7 +231,7 @@ func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *aut
 				ID        string          `json:"id"`
 				Event     string          `json:"event"`
 				Arguments json.RawMessage `json:"arguments"`
-				Args
+				WakeArgs
 			}
 			json.Unmarshal(req.Params.Arguments, &in)
 			u := user(ctx, req)
@@ -250,8 +256,8 @@ func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *aut
 			var out struct {
 				Ended bool `json:"ended"`
 			}
-			if err := a.appCall(ctx, "POST", "/api/apps/v1/event-subscriptions/unsubscribe",
-				map[string]any{"call": callOf(ctx, req, in.Args), "name": t.name, "arguments": args}, &out); err != nil {
+			if err := a.eventsCall(ctx, "POST", "/api/apps/v1/event-subscriptions/unsubscribe",
+				map[string]any{"call": callOf(ctx, req, in.WakeArgs), "name": t.name, "arguments": args}, &out); err != nil {
 				return textResult(fill("unsubscribe_failed", "{detail}", detailOf(err)), true), nil
 			}
 			key := "not_subscribed"
@@ -260,7 +266,13 @@ func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *aut
 			}
 			return textResult(fill(key, "{event}", t.name, "{arguments}", string(args)), false), nil
 		})
-	srv.AddTool(&mcp.Tool{Name: listTool, Description: eventTools["list_description"], InputSchema: toolSchema(nil)},
+	// list_subscriptions only reads: marked so (readOnlyHint), clients that
+	// approve read-only tools without asking (Codex, by default) don't ask.
+	// idempotentHint is true, as in every SDK (the shared golden file
+	// events-list.json): Go's MCP SDK always sends it, and false would say
+	// that calling it twice differs.
+	add(&mcp.Tool{Name: ListSubscriptionsTool, Description: eventTools["list_description"], InputSchema: toolSchema(nil),
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true}},
 		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			u := user(ctx, req)
 			if u == "" {
@@ -308,7 +320,7 @@ func (a *App) EventSubscriptions(ctx context.Context, user string) ([]EventSubsc
 	var out struct {
 		Subscriptions []EventSubscription `json:"subscriptions"`
 	}
-	err := a.appCall(ctx, "POST", "/api/apps/v1/event-subscriptions/list", map[string]any{"user": user}, &out)
+	err := a.eventsCall(ctx, "POST", "/api/apps/v1/event-subscriptions/list", map[string]any{"user": user}, &out)
 	return out.Subscriptions, err
 }
 
@@ -319,6 +331,6 @@ func (a *App) EndEventSubscription(ctx context.Context, user, id string) (bool, 
 	var out struct {
 		Ended bool `json:"ended"`
 	}
-	err := a.appCall(ctx, "POST", "/api/apps/v1/event-subscriptions/end", map[string]any{"user": user, "id": id}, &out)
+	err := a.eventsCall(ctx, "POST", "/api/apps/v1/event-subscriptions/end", map[string]any{"user": user, "id": id}, &out)
 	return out.Ended, err
 }

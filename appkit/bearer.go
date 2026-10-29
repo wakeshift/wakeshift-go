@@ -76,7 +76,7 @@ type verifiedKey struct{}
 // RequireBearer wraps an MCP endpoint so each request needs a bearer token
 // verify accepts. It's the MCP SDK's auth.RequireBearerToken (tools read the
 // TokenInfo at req.Extra.TokenInfo), except that the 401 for a refused token
-// says error="invalid_token" (see App.RefuseToken), so clients refresh
+// says error="invalid_token", so clients refresh
 // rather than ask the user to sign in again, and each refusal is logged with
 // its reason (a TokenError's), the client (its User-Agent) and, for an
 // expired token, how long past expiry it was. Never the token.

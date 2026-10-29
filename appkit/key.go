@@ -5,7 +5,6 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"os"
-	"strings"
 
 	"github.com/wakeshift/wakeshift-go/internal/appkey"
 )
@@ -30,43 +29,24 @@ const keyPrefix = appkey.Prefix
 // default: it came from another console.
 const DefaultCore = "https://app.wakeshift.ai"
 
-// ParseAppKey reads an app key from the console: its mode and the app's ID
-// (both empty for a current key, which names neither: see Open) and its
+// parseAppKey reads an app key from the console, either format: the app's
+// ID (empty for a current key, which doesn't name it: see Open) and its
 // private key. A current key's checksum is checked, so a mistyped key
 // fails here, not at Wakeshift.
-//
-// Deprecated: the mode means nothing now, and current keys don't carry the
-// app's ID. Use Open, or ParseKey for the private key.
-func ParseAppKey(s string) (mode, appID string, key ed25519.PrivateKey, err error) {
+func parseAppKey(s string) (appID string, key ed25519.PrivateKey, err error) {
 	k, err := appkey.Parse(s)
 	if err != nil {
-		return "", "", nil, errors.New("appkit: " + err.Error())
+		return "", nil, errors.New("appkit: " + err.Error())
 	}
-	return k.Mode, k.AppID, k.Private(), nil
-}
-
-// FromKey returns the App an older app key from the console (wst_test_…,
-// wst_live_…) names, connected to Wakeshift at core. mcpURL is the app's
-// MCP endpoint, if it has one. A current key doesn't name its app: use
-// Open, which asks Wakeshift.
-func FromKey(appKey, core, mcpURL string) (*App, error) {
-	_, id, key, err := ParseAppKey(appKey)
-	if err != nil {
-		return nil, err
-	}
-	if id == "" {
-		return nil, errors.New("appkit: this key doesn't name its app; use appkit.Open(ctx, key, core, mcpURL), which asks Wakeshift")
-	}
-	return &App{ID: id, Key: key, Core: core, MCPURL: mcpURL}, nil
+	return k.AppID, k.Private(), nil
 }
 
 // Open returns the App for an app key from the console, either format,
 // with its ID: from the key, if it names the app, or else from Wakeshift
 // (GET /api/apps/v1/app, once). core is Wakeshift's base URL; "" reads
 // WAKESHIFT_CORE, then falls back to DefaultCore, except for a wst_test_
-// key, which needs one of the two. mcpURL is the app's MCP endpoint, if it
-// has one.
-func Open(ctx context.Context, appKey, core, mcpURL string) (*App, error) {
+// key, which needs one of the two.
+func Open(ctx context.Context, appKey, core string) (*App, error) {
 	k, err := appkey.Parse(appKey)
 	if err != nil {
 		return nil, errors.New("appkit: " + err.Error())
@@ -80,7 +60,7 @@ func Open(ctx context.Context, appKey, core, mcpURL string) (*App, error) {
 		}
 		core = DefaultCore
 	}
-	a := &App{ID: k.AppID, Key: k.Private(), Core: core, MCPURL: mcpURL}
+	a := &App{ID: k.AppID, Key: k.Private(), Core: core}
 	if a.ID == "" {
 		info, err := a.Info(ctx)
 		if err != nil {
@@ -114,25 +94,3 @@ func (a *App) Info(ctx context.Context) (AppInfo, error) {
 // kid names a.Key in assertions (appkey.KeyID): Wakeshift finds the key,
 // and so the app, by it.
 func (a *App) kid() string { return appkey.KeyID(a.Key.Public().(ed25519.PublicKey)) }
-
-// Load returns the App for key: an app key from the console (wst_…), or a
-// bare base64 Ed25519 key (ParseKey) for the app id, the way Wakeshift's
-// own apps are deployed. An older key names its app; for a current one,
-// which doesn't, the app is id.
-func Load(id, key, core, mcpURL string) (*App, error) {
-	if strings.HasPrefix(strings.TrimSpace(key), keyPrefix) {
-		_, named, k, err := ParseAppKey(key)
-		if err != nil {
-			return nil, err
-		}
-		if named != "" {
-			id = named
-		}
-		return &App{ID: id, Key: k, Core: core, MCPURL: mcpURL}, nil
-	}
-	k, err := ParseKey(key)
-	if err != nil {
-		return nil, err
-	}
-	return &App{ID: id, Key: k, Core: core, MCPURL: mcpURL}, nil
-}

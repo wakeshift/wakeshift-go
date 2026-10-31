@@ -16,6 +16,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/wakeshift/wakeshift-go/appkit/internal/adapt"
 	"github.com/wakeshift/wakeshift-go/internal/mcpevents/event"
 )
 
@@ -72,9 +73,9 @@ type EventsOptions struct {
 type Attachment struct {
 	app      *App
 	identify func(context.Context, *auth.TokenInfo) Identity
-	events   EventsOptions
-	warned   sync.Map // warnOnce's keys
-	schemas  sync.Map // *mcp.Tool → its input schema, decoded (undeclared.go)
+	native   func(context.Context, adapt.Request) bool // EventsOptions.Native, for any library's request
+	warned   sync.Map                                  // warnOnce's keys
+	schemas  sync.Map                                  // *mcp.Tool → its input schema, decoded (undeclared.go)
 }
 
 // Attach attaches Wakeshift to the app's MCP server: the one call that
@@ -119,10 +120,14 @@ type Attachment struct {
 //	h := mcp.NewStreamableHTTPHandler(…, &mcp.StreamableHTTPOptions{Stateless: true})
 //	mux.Handle("/mcp", requireAuth(attached.Wrap(h)))
 func (a *App) Attach(srv *mcp.Server, opts AttachOptions) *Attachment {
-	if len(a.events()) == 0 {
-		panic("appkit: Attach needs at least one event (DefineEvent) defined first")
+	var native func(context.Context, adapt.Request) bool
+	if f := opts.Events.Native; f != nil {
+		native = func(ctx context.Context, r adapt.Request) bool {
+			req, _ := r.Lib.(*mcp.CallToolRequest)
+			return req != nil && f(ctx, req)
+		}
 	}
-	at := &Attachment{app: a, events: opts.Events, identify: func(ctx context.Context, ti *auth.TokenInfo) Identity {
+	at := a.attach(func(ctx context.Context, ti *auth.TokenInfo) Identity {
 		if ti == nil || opts.Identify == nil {
 			return Identity{}
 		}
@@ -131,14 +136,27 @@ func (a *App) Attach(srv *mcp.Server, opts AttachOptions) *Attachment {
 			return Identity{}
 		}
 		return id
-	}}
-	a.addEventTools(srv, at.identify, builtinTools(opts.Tools))
+	}, native)
+	for _, t := range a.eventTools(at, builtinTools(opts.Tools)) {
+		srv.AddTool(goSDKTool(t))
+	}
 	// The MCP server's own pipeline: every request Wrap passes on comes
 	// through here. A wrapped tool's call (Events) gets its block here,
 	// after the MCP SDK has validated the output and filled
 	// structuredContent, and the subscriptions it made are rolled back here
 	// if the final result failed.
 	srv.AddReceivingMiddleware(at.middleware)
+	return at
+}
+
+// attach is Attach without the MCP library: the Attachment, and the app
+// marked as serving its tools. The MCP library's side (go-sdk's Attach, or
+// an adapter's) adds the tools and the per-call scope.
+func (a *App) attach(identify func(context.Context, *auth.TokenInfo) Identity, native func(context.Context, adapt.Request) bool) *Attachment {
+	if len(a.events()) == 0 {
+		panic("appkit: Attach needs at least one event (DefineEvent) defined first")
+	}
+	at := &Attachment{app: a, identify: identify, native: native}
 	// A process that serves the app's tools sends the manifest
 	// automatically (manifest.go); one that only emits never does.
 	a.mu.Lock()

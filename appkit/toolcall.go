@@ -37,6 +37,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/wakeshift/wakeshift-go/appkit/internal/adapt"
 	"github.com/wakeshift/wakeshift-go/internal/mcpevents/event"
 )
 
@@ -58,11 +59,7 @@ type WakeInput interface{ wakeArgs() WakeArgs }
 // structured result carries Wakeshift's block in (without a beacon line),
 // for hosts that show the model only structuredContent. The three SDKs use
 // the same name.
-const WakeshiftField = "wakeshift"
-
-// wakeshiftFieldDescription is what the field is, in a wrapped tool's
-// output schema.
-const wakeshiftFieldDescription = "What Wakeshift adds for this conversation: how it's woken by this app's events"
+const WakeshiftField = adapt.WakeshiftField
 
 // WakeOutput, embedded in a wrapped tool's output, declares its wakeshift
 // field in the type itself. It's optional: every structured result of a
@@ -166,30 +163,29 @@ func Events[In WakeInput, Out any](at *Attachment, h func(context.Context, *Tool
 	var zero Out
 	return func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
 		s, _ := ctx.Value(scopeKey{}).(*callScope)
-		if s == nil || s.at != at || s.req != req {
+		if s == nil || s.at != at || s.goReq != req {
 			return nil, zero, errNotAttached
 		}
-		args := in.wakeArgs()
-		c, id := at.newToolCall(ctx, req, args)
-		c.s = s
-		s.begin(c, id, args)
+		s.begin(ctx, in.wakeArgs())
 		defer s.end()
-		return h(ctx, c, in)
+		return h(ctx, s.call, in)
 	}
 }
 
-// newToolCall is the ToolCall for req, before its handler runs.
-func (at *Attachment) newToolCall(ctx context.Context, req *mcp.CallToolRequest, args WakeArgs) (*ToolCall, Identity) {
-	var id Identity
-	if req.Extra != nil {
-		id = at.identify(ctx, req.Extra.TokenInfo)
-	}
-	c := &ToolCall{Request: req, User: id.User, Agent: id.Agent, Session: args.SessionKey}
-	if req.Params != nil {
-		c.Tool = req.Params.Name
-	}
-	c.Native, c.NativeConversation = at.nativeOf(ctx, req, id.Client)
-	return c, id
+// newScope is the scope of one tools/call, before its handler runs.
+func (at *Attachment) newScope(r adapt.Request) *callScope {
+	s := &callScope{at: at, req: r}
+	s.goReq, _ = r.Lib.(*mcp.CallToolRequest)
+	return s
+}
+
+// begin makes the call's ToolCall, as its wrapped handler starts.
+func (s *callScope) begin(ctx context.Context, args WakeArgs) {
+	id := s.at.identify(ctx, s.req.Token)
+	c := &ToolCall{Request: s.goReq, User: id.User, Agent: id.Agent, Session: args.SessionKey, Tool: s.req.Tool, s: s}
+	c.Native, c.NativeConversation = s.at.nativeOf(ctx, s.req, id.Client)
+	s.call, s.identity, s.args = c, id, args
+	s.wrapped.Store(true)
 }
 
 // nativeOf says whether a call comes from a client that subscribes to the
@@ -199,30 +195,28 @@ func (at *Attachment) newToolCall(ctx context.Context, req *mcp.CallToolRequest,
 // _meta's, else Identity.Client) or User-Agent product token of a known
 // native client; a client that declares the MCP Events extension.
 // conversation is ChatGPT's conversation, when it names one.
-func (at *Attachment) nativeOf(ctx context.Context, req *mcp.CallToolRequest, identified string) (native bool, conversation string) {
-	var meta map[string]any
-	if req.Params != nil {
-		meta = req.Params.GetMeta()
-	}
+func (at *Attachment) nativeOf(ctx context.Context, r adapt.Request, identified string) (native bool, conversation string) {
+	meta := r.Meta
 	conversation, _ = meta["openai/session"].(string)
-	if f := at.events.Native; f != nil && f(ctx, req) {
+	if f := at.native; f != nil && f(ctx, r) {
 		return true, conversation
 	}
 	if conversation != "" {
 		return true, conversation
 	}
 	var ua string
-	client := clientName(req, identified)
-	if req.Extra != nil && req.Extra.Header != nil {
-		ua = req.Extra.Header.Get("User-Agent")
+	client := r.Client
+	if client == "" {
+		client = identified
+	}
+	if r.Header != nil {
+		ua = r.Header.Get("User-Agent")
 	}
 	if event.DialectOf(client, ua) == event.DialectChatGPT {
 		return true, ""
 	}
-	if caps := req.ClientCapabilities(); caps != nil {
-		if _, ok := caps.Extensions[event.ExtensionKey]; ok {
-			return true, ""
-		}
+	if _, ok := r.Extensions[event.ExtensionKey]; ok {
+		return true, ""
 	}
 	if metaCaps, _ := meta["io.modelcontextprotocol/clientCapabilities"].(map[string]any); metaCaps != nil {
 		ext, _ := metaCaps["extensions"].(map[string]any)
@@ -239,8 +233,9 @@ type scopeKey struct{}
 // callScope is one tools/call as Attach's middleware sees it: what its
 // wrapped handler subscribed, for the block and the rollback.
 type callScope struct {
-	at  *Attachment
-	req *mcp.CallToolRequest
+	at    *Attachment
+	req   adapt.Request
+	goReq *mcp.CallToolRequest // req's, when go-sdk serves it
 
 	wrapped atomic.Bool
 	call    *ToolCall
@@ -274,11 +269,6 @@ type nativeLine struct {
 
 // maxNativeLines is the most native lines Wakeshift takes for one call.
 const maxNativeLines = 20
-
-func (s *callScope) begin(c *ToolCall, id Identity, args WakeArgs) {
-	s.call, s.identity, s.args = c, id, args
-	s.wrapped.Store(true)
-}
 
 // end closes the call to further requests, after waiting for any in flight
 // (warning once per tool: the handler should have waited for them).
@@ -340,7 +330,7 @@ func (s *callScope) leave() {
 // conversation's session, and who's calling (the user, or the agent's
 // token).
 func (c *ToolCall) wire() wireCall {
-	call := callFrom(c.Request, "", c.Session).withArgs(c.s.args)
+	call := wireOf(c.s.req, "", c.Session).withArgs(c.s.args)
 	return c.s.identity.apply(call)
 }
 

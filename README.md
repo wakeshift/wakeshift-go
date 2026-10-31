@@ -92,6 +92,32 @@ note.Emit(ctx, noteArgs{}, notification{From: "ada", Text: "@bo look"},
 
 `Status` and `StatusOf` say who is subscribed and connected now; `PublishURL` makes a URL that emits an event from a service's webhook.
 
+## mcp-go
+
+A server built with [mcp-go](https://github.com/mark3labs/mcp-go) (v1.5 or later) attaches with `appkit/mcpgo`: `mcpgo.Attach(wake, srv, opts)` and `mcpgo.Events(attached, tool, handler)`, which returns a `server.ServerTool` for `srv.AddTools`. Events, `Subscribe` and `Emit` are the same `appkit` calls. An app on the official SDK never builds mcp-go.
+
+```go mcp-go
+srv := server.NewMCPServer("chat", "1.0.0")
+attached := mcpgo.Attach(wake, srv, mcpgo.AttachOptions{
+	Identify: func(_ context.Context, ti *auth.TokenInfo) (appkit.Identity, error) {
+		if ti == nil {
+			return appkit.Identity{}, nil
+		}
+		return appkit.Identity{User: ti.UserID}, nil
+	},
+})
+srv.AddTools(mcpgo.Events(attached, mcp.NewTool("join", mcp.WithDescription("Join a channel"), mcp.WithString("channel", mcp.Required())),
+	func(ctx context.Context, call *appkit.ToolCall, _ mcp.CallToolRequest, in joinIn) (*mcp.CallToolResult, error) {
+		if _, err := msg.Subscribe(ctx, call, channelArgs{Channel: in.Channel}); err != nil {
+			return nil, err
+		}
+		return mcp.NewToolResultText("Joined #" + in.Channel + "."), nil
+	}))
+mux.Handle("/mcp", requireAuth(attached.Wrap(server.NewStreamableHTTPServer(srv))))
+```
+
+`Events` adds `session_key`, `harness` and `conversation_id` to the tool's input schema for you. `Identify` runs for every request, with the token `appkit.RequireBearer` verified or `nil`, so an app that authenticates another way reads who it is from `ctx`.
+
 ## Sign-in
 
 Your app identifies its own users, with its own sign-in; Wakeshift never signs them in for you. Return your user's ID from `AttachOptions.Identify`, and Wakeshift keeps a record per user for your app. On a stateless server, which never sees `initialize`, also return the MCP client's name as your sign-in knows it (`Identity.Client`, an OAuth registration's `client_name`, say), so Wakeshift can tell which program the agent runs in; a name the request carries wins. Users never see Wakeshift. To act for a user's agent, `Workspace` and `AddAgent` set it up, `ActAs` acts for it, `CheckAgent` says whether its grant is still live, and `HarnessAgent` names the agent after its MCP client (`claude-code`). `RequireBearer` checks the tokens your sign-in issues on your MCP endpoint, and `ForgetUser` deletes what Wakeshift keeps for a user.

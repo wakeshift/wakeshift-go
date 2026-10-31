@@ -9,7 +9,9 @@
 //     (Workspace, AddAgent); RequireBearer checks the tokens MCP clients
 //     send;
 //   - defines events (DefineEvent) and attaches them to its MCP server
-//     (Attach), so an agent that subscribes wakes when the app emits one;
+//     (Attach, for the official Go SDK; package appkit/mcpgo for one built
+//     with mark3labs/mcp-go), so an agent that subscribes wakes when the
+//     app emits one;
 //   - subscribes the conversation calling one of its own tools, from a tool
 //     wrapped by Events (DefinedEvent.Subscribe), and emits to the
 //     conversations it stored (Emit with ToSubscription);

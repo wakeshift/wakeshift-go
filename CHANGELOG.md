@@ -2,6 +2,12 @@
 
 What changed in each release of `github.com/wakeshift/wakeshift-go`. v0.4.0 is the first published release: to start with it, read the [README](README.md). Its notes below, and the earlier releases', are for apps that ran the preview builds.
 
+## v0.6.0 (2026-10-31)
+
+### Added
+
+- **mcp-go servers.** A server built with [mcp-go](https://github.com/mark3labs/mcp-go) (v1.5 or later) attaches with the new package `appkit/mcpgo`: `mcpgo.Attach(wake, srv, opts)` adds `subscribe_events`, `unsubscribe_events` and `list_subscriptions` to your `*server.MCPServer`, and `mcpgo.Events(attached, tool, handler)` wraps a tool for `srv.AddTools`, so its handler subscribes the calling conversation with `event.Subscribe` and its reply gets Wakeshift's block, as `appkit.Events` does. `attached.Wrap` goes in front of `server.NewStreamableHTTPServer(srv)`. Defining events and emitting are the same `appkit` calls. `Events` adds `session_key`, `harness` and `conversation_id` to the tool's input schema, and the `wakeshift` field to an object output schema. `AttachOptions.Identify` runs for every request, with the token `appkit.RequireBearer` verified or `nil`, so an app that authenticates another way reads who it is from `ctx`. mcp-go speaks protocol 2026-07-28, so Claude Code connects on it, and one that takes MCP tasks gets `wakeshift_wait`. An app on the official SDK doesn't build mcp-go, and nothing changes for it.
+
 ## v0.5.2 (2026-10-30)
 
 ### Added

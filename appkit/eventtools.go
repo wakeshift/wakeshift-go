@@ -14,8 +14,9 @@ import (
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
-	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/wakeshift/wakeshift-go/appkit/internal/adapt"
 )
 
 // The names of Attach's own tools, for AttachOptions.Tools.
@@ -134,8 +135,8 @@ func toolSchema(props map[string]any, required ...string) map[string]any {
 	return out
 }
 
-func textResult(text string, isErr bool) *mcp.CallToolResult {
-	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}, IsError: isErr}
+func textResult(text string, isErr bool) adapt.Result {
+	return adapt.Result{Text: text, IsError: isErr}
 }
 
 // compact is JSON without spaces ({} for none).
@@ -156,12 +157,40 @@ func detailOf(err error) string {
 	return err.Error()
 }
 
-// addEventTools adds the tools to srv.
-func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *auth.TokenInfo) Identity, tools map[string]bool) {
+// goSDKTool is one of Attach's own tools for go-sdk's Server.AddTool.
+func goSDKTool(t adapt.Tool) (*mcp.Tool, mcp.ToolHandler) {
+	tool := &mcp.Tool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema}
+	if t.ReadOnly || t.Idempotent {
+		tool.Annotations = &mcp.ToolAnnotations{ReadOnlyHint: t.ReadOnly, IdempotentHint: t.Idempotent}
+	}
+	return tool, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		var args json.RawMessage
+		if req.Params != nil {
+			args = req.Params.Arguments
+		}
+		out := t.Run(ctx, requestOf(req), args)
+		res := &mcp.CallToolResult{IsError: out.IsError}
+		if out.Text != "" {
+			res.Content = []mcp.Content{&mcp.TextContent{Text: out.Text}}
+		}
+		if len(out.Meta) > 0 {
+			res.Meta = mcp.Meta{}
+			for k, v := range out.Meta {
+				res.Meta[k] = v
+			}
+		}
+		return res, nil
+	}
+}
+
+// eventTools is Attach's own tools that tools names, in a form any MCP
+// library's side adds.
+func (a *App) eventTools(at *Attachment, tools map[string]bool) []adapt.Tool {
+	var out []adapt.Tool
 	// add adds one of the tools, if the app wants it (AttachOptions.Tools).
-	add := func(t *mcp.Tool, h mcp.ToolHandler) {
+	add := func(t adapt.Tool) {
 		if tools[t.Name] {
-			srv.AddTool(t, h)
+			out = append(out, t)
 		}
 	}
 	types := a.events()
@@ -169,43 +198,40 @@ func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *aut
 	for i, t := range types {
 		names[i] = t.name
 	}
-	who := func(ctx context.Context, req *mcp.CallToolRequest) Identity {
-		if req.Extra == nil {
-			return Identity{}
-		}
-		return identify(ctx, req.Extra.TokenInfo)
+	who := func(ctx context.Context, req adapt.Request) Identity {
+		return at.identify(ctx, req.Token)
 	}
-	user := func(ctx context.Context, req *mcp.CallToolRequest) string {
+	user := func(ctx context.Context, req adapt.Request) string {
 		return who(ctx, req).apply(wireCall{}).User
 	}
 	// callOf is the tool call as Wakeshift takes it (with the app's agent,
 	// if Identify gives one; "" for the user if there's none).
-	callOf := func(ctx context.Context, req *mcp.CallToolRequest, args WakeArgs) wireCall {
-		return who(ctx, req).apply(callFrom(req, "", args.SessionKey).withArgs(args))
+	callOf := func(ctx context.Context, req adapt.Request, args WakeArgs) wireCall {
+		return who(ctx, req).apply(wireOf(req, "", args.SessionKey).withArgs(args))
 	}
 	argsProp := map[string]any{"type": "object", "description": eventTools["arguments_argument"]}
 	if len(types) > 0 {
-		add(&mcp.Tool{Name: SubscribeEventsTool, Description: eventTools["subscribe_description"] + eventTools["events_heading"] + eventsListing(types),
+		add(adapt.Tool{Name: SubscribeEventsTool, Description: eventTools["subscribe_description"] + eventTools["events_heading"] + eventsListing(types),
 			InputSchema: toolSchema(map[string]any{"event": map[string]any{"type": "string", "enum": names, "description": eventTools["event_argument"]},
-				"arguments": argsProp}, "event")},
-			func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				"arguments": argsProp}, "event"),
+			Run: func(ctx context.Context, req adapt.Request, raw json.RawMessage) adapt.Result {
 				var in struct {
 					Event     string          `json:"event"`
 					Arguments json.RawMessage `json:"arguments"`
 					WakeArgs
 				}
-				json.Unmarshal(req.Params.Arguments, &in)
+				json.Unmarshal(raw, &in)
 				t := a.eventByName(in.Event)
 				if t == nil {
-					return textResult(fill("unknown_event", "{event}", in.Event), true), nil
+					return textResult(fill("unknown_event", "{event}", in.Event), true)
 				}
 				args := t.knownJSON(json.RawMessage(compact(in.Arguments)))
 				call := callOf(ctx, req, in.WakeArgs)
 				if t.personal && call.User == "" {
-					return textResult(fill("personal_no_user", "{event}", t.name), true), nil
+					return textResult(fill("personal_no_user", "{event}", t.name), true)
 				}
 				if t.authorize != nil && !t.authorize(ctx, Subscriber{User: call.User, Client: call.Client}, args) {
-					return textResult(fill("refused", "{event}", t.name), true), nil
+					return textResult(fill("refused", "{event}", t.name), true)
 				}
 				var out struct {
 					EventSubscription struct {
@@ -215,43 +241,43 @@ func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *aut
 					Addition addition `json:"addition"`
 				}
 				if err := a.eventsCall(ctx, "POST", "/api/apps/v1/event-subscriptions", map[string]any{"call": call, "name": t.name, "arguments": args}, &out); err != nil {
-					return textResult(fill("subscribe_failed", "{detail}", detailOf(err)), true), nil
+					return textResult(fill("subscribe_failed", "{detail}", detailOf(err)), true)
 				}
 				key := "renewed"
 				if out.EventSubscription.Created {
 					key = "subscribed"
 				}
-				return out.Addition.apply(&mcp.CallToolResult{}, fill(key, "{event}", t.name, "{arguments}", compact(out.EventSubscription.Arguments))), nil
-			})
+				return out.Addition.result(fill(key, "{event}", t.name, "{arguments}", compact(out.EventSubscription.Arguments)))
+			}})
 	}
-	add(&mcp.Tool{Name: UnsubscribeEventsTool, Description: eventTools["unsubscribe_description"],
+	add(adapt.Tool{Name: UnsubscribeEventsTool, Description: eventTools["unsubscribe_description"],
 		InputSchema: toolSchema(map[string]any{"event": map[string]any{"type": "string", "enum": names, "description": eventTools["event_argument"]},
-			"arguments": argsProp, "id": map[string]any{"type": "string", "description": eventTools["id_argument"]}})},
-		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			"arguments": argsProp, "id": map[string]any{"type": "string", "description": eventTools["id_argument"]}}),
+		Run: func(ctx context.Context, req adapt.Request, raw json.RawMessage) adapt.Result {
 			var in struct {
 				ID        string          `json:"id"`
 				Event     string          `json:"event"`
 				Arguments json.RawMessage `json:"arguments"`
 				WakeArgs
 			}
-			json.Unmarshal(req.Params.Arguments, &in)
+			json.Unmarshal(raw, &in)
 			u := user(ctx, req)
 			if in.ID != "" {
 				if u == "" {
-					return textResult(eventTools["end_no_user"], true), nil
+					return textResult(eventTools["end_no_user"], true)
 				}
 				ended, err := a.EndEventSubscription(ctx, u, in.ID)
 				if err != nil {
-					return textResult(fill("unsubscribe_failed", "{detail}", detailOf(err)), true), nil
+					return textResult(fill("unsubscribe_failed", "{detail}", detailOf(err)), true)
 				}
 				if ended {
-					return textResult(fill("ended", "{id}", in.ID), false), nil
+					return textResult(fill("ended", "{id}", in.ID), false)
 				}
-				return textResult(fill("no_such_id", "{id}", in.ID), false), nil
+				return textResult(fill("no_such_id", "{id}", in.ID), false)
 			}
 			t := a.eventByName(in.Event)
 			if t == nil {
-				return textResult(eventTools["need"], true), nil
+				return textResult(eventTools["need"], true)
 			}
 			args := t.knownJSON(json.RawMessage(compact(in.Arguments)))
 			var out struct {
@@ -259,32 +285,32 @@ func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *aut
 			}
 			if err := a.eventsCall(ctx, "POST", "/api/apps/v1/event-subscriptions/unsubscribe",
 				map[string]any{"call": callOf(ctx, req, in.WakeArgs), "name": t.name, "arguments": args}, &out); err != nil {
-				return textResult(fill("unsubscribe_failed", "{detail}", detailOf(err)), true), nil
+				return textResult(fill("unsubscribe_failed", "{detail}", detailOf(err)), true)
 			}
 			key := "not_subscribed"
 			if out.Ended {
 				key = "unsubscribed"
 			}
-			return textResult(fill(key, "{event}", t.name, "{arguments}", string(args)), false), nil
-		})
+			return textResult(fill(key, "{event}", t.name, "{arguments}", string(args)), false)
+		}})
 	// list_subscriptions only reads: marked so (readOnlyHint), clients that
 	// approve read-only tools without asking (Codex, by default) don't ask.
 	// idempotentHint is true, as in every SDK (the shared golden file
 	// events-list.json): Go's MCP SDK always sends it, and false would say
 	// that calling it twice differs.
-	add(&mcp.Tool{Name: ListSubscriptionsTool, Description: eventTools["list_description"], InputSchema: toolSchema(nil),
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true}},
-		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	add(adapt.Tool{Name: ListSubscriptionsTool, Description: eventTools["list_description"], InputSchema: toolSchema(nil),
+		ReadOnly: true, Idempotent: true,
+		Run: func(ctx context.Context, req adapt.Request, _ json.RawMessage) adapt.Result {
 			u := user(ctx, req)
 			if u == "" {
-				return textResult(eventTools["list_no_user"], true), nil
+				return textResult(eventTools["list_no_user"], true)
 			}
 			subs, err := a.EventSubscriptions(ctx, u)
 			if err != nil {
-				return textResult(fill("list_failed", "{detail}", detailOf(err)), true), nil
+				return textResult(fill("list_failed", "{detail}", detailOf(err)), true)
 			}
 			if len(subs) == 0 {
-				return textResult(eventTools["none"], false), nil
+				return textResult(eventTools["none"], false)
 			}
 			var lines []string
 			for _, s := range subs {
@@ -302,8 +328,9 @@ func (a *App) addEventTools(srv *mcp.Server, identify func(context.Context, *aut
 				lines = append(lines, fill("item", "{id}", s.ID, "{event}", s.Event, "{arguments}", compact(s.Arguments),
 					"{destination}", dest, "{since}", s.CreatedAt.UTC().Format(time.DateOnly)))
 			}
-			return textResult(fill("list", "{lines}", strings.Join(lines, "\n")), false), nil
-		})
+			return textResult(fill("list", "{lines}", strings.Join(lines, "\n")), false)
+		}})
+	return out
 }
 
 // EventSubscription is one of a user's subscriptions to the app's event

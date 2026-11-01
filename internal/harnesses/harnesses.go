@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 )
 
 // Wake is how Wakeshift's messages reach a harness's conversation.
@@ -89,10 +90,17 @@ type Harness struct {
 	// Clients are the MCP clientInfo names it sends in initialize
 	// (compared case-insensitively).
 	Clients []string
-	// Unsure, if set, is the condition its notes start with ("If you're
-	// …:"), for a harness whose client name others send too (Hermes Agent
-	// sends the MCP Python SDK's default, "mcp"): the agent learns
-	// whether the note is for it, and its agent isn't named after it.
+	// Shared are the names among Clients that other clients send too
+	// (Hermes Agent before 0.22.5 sent the MCP Python SDK's default,
+	// "mcp"). A call recognized only by one is Unsure. A harness with any
+	// names its agents after the client's own name (AgentID), whichever of
+	// its names it sends, so a conversation keeps its agent (and its
+	// session key) across the harness's versions.
+	Shared []string
+	// Unsure, set with Shared, is the condition its notes start with ("If
+	// you're …:") when a call was recognized only by a Shared name: the
+	// agent learns whether the note is for it. A call from one of its own
+	// names isn't Unsure (Surely).
 	Unsure string
 	// Fingerprint is a tools/call _meta key (dotted as ConversationMeta)
 	// that only this harness sends, with a string value: how a call is
@@ -372,9 +380,16 @@ var all = []Harness{
 		Verified:    "2026.10.4",
 	},
 	{
-		// clientInfo "mcp" 0.1.0 and User-Agent python-httpx2/2.12.0 are the
-		// MCP Python SDK's defaults, which other Python clients send too.
-		ID: "hermes", Name: "Hermes Agent", Claim: "hermes", Aliases: []string{"hermes-agent"}, Clients: []string{"mcp"}, Unsure: "you're Hermes Agent (Nous Research)",
+		// clientInfo "hermes-agent" with Hermes's version (0.22.5): Hermes
+		// sets it itself now. Earlier versions sent "mcp" 0.1.0, the MCP
+		// Python SDK's default, which other Python clients send too. The
+		// User-Agent, python-httpx2/2.12.0, is the SDK's either way. Its
+		// plugin also passes the harness argument to every Wakeshift app's
+		// tool (plugins/hermes, fill_harness), for an app that never sees
+		// the client name (a stateless server on a protocol before
+		// 2026-07-28).
+		ID: "hermes", Name: "Hermes Agent", Claim: "hermes", Aliases: []string{"hermes-agent"},
+		Clients: []string{"hermes-agent", "mcp"}, Shared: []string{"mcp"}, Unsure: "you're Hermes Agent (Nous Research)",
 		Wake: Plugin, Ack: "at least once, acknowledged once Hermes accepts the run",
 		Binding: Unbound, Carrier: Meta, Installable: true,
 		Changes:     "adds Wakeshift's plugin, $HERMES_HOME/plugins/wakeshift, and enables it",
@@ -385,7 +400,7 @@ var all = []Harness{
 		AfterUpdate: "There's nothing to approve again, but Hermes loads plugins only when a chat starts or is resumed: ask them to resume this chat (exit and run `hermes chat --continue`, or restart Hermes's gateway) or start a new one, so it loads the new plugin.",
 		When:        "as soon as they arrive, even while it's idle, as long as Hermes is running (conversations through Hermes's API server or CLI)",
 		NoteAt:      "right after this result",
-		Verified:    "0.22.2",
+		Verified:    "0.22.5",
 	},
 	{
 		// ChatGPT (and other OpenAI-hosted MCP clients) send clientInfo
@@ -482,7 +497,7 @@ func ExactClient(name string) (Harness, bool) {
 	if base == "" {
 		return Harness{}, false
 	}
-	if h, ok := ForClient(base); ok && h.Unsure == "" { // a generic name others send too doesn't count tagged
+	if h, ok := ForClient(base); ok && Surely(h, base).Unsure == "" { // a generic name others send too doesn't count tagged
 		return h, true
 	}
 	for _, h := range all {
@@ -523,7 +538,7 @@ func Recognize(client string, meta map[string]any, userAgent string) (Harness, V
 		}
 	}
 	if h, ok := ForClient(client); ok {
-		return h, ByClient, true
+		return Surely(h, client), ByClient, true
 	}
 	if strings.TrimSpace(client) != "" {
 		if h, ok := Get(AgentID(client)); ok {
@@ -545,6 +560,34 @@ func Recognize(client string, meta map[string]any, userAgent string) (Harness, V
 		}
 	}
 	return Harness{}, "", false
+}
+
+// Surely is h as a call from client is recognized: a harness with a client
+// name others send too (Unsure) isn't Unsure when the call sent one of its
+// own names that isn't Shared (Hermes Agent's "hermes-agent"), so its
+// notes don't hedge and a claim can't override it (Refine). h as it is
+// otherwise.
+func Surely(h Harness, client string) Harness {
+	c := strings.TrimSpace(client)
+	if h.Unsure == "" || c == "" || containsFold(h.Shared, c) || !containsFold(h.Clients, c) {
+		return h
+	}
+	h.Unsure = ""
+	return h
+}
+
+// NamedByClient reports whether h's agents are named after the client's
+// own name (AgentID) rather than h's ID: a harness with a client name
+// others send too (Harness.Shared).
+func NamedByClient(h Harness) bool { return len(h.Shared) > 0 }
+
+func containsFold(list []string, s string) bool {
+	for _, x := range list {
+		if strings.EqualFold(x, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // uaProducts are a User-Agent's product names, lowercase, without versions
@@ -575,15 +618,17 @@ func uaProducts(ua string) []string {
 // its name ("Claude Code (wakeshift)" → claude-code, "Copilot CLI" →
 // copilot) or a variant of its ID ("claude-code-vscode" → claude-code);
 // else the name itself as an ID ("My Client" → my-client). IDs are 2-40
-// lowercase letters, digits and dashes; "agent" if nothing's left. A client
-// name others send too (Unsure: Hermes Agent's "mcp") keeps its own ID.
+// lowercase letters, digits and dashes; "agent" if nothing's left. A
+// harness with a client name others send too (NamedByClient: Hermes
+// Agent's "mcp") keeps the client's own name as the ID, whichever of its
+// names it sends ("mcp", "hermes-agent").
 func AgentID(client string) string {
-	if h, ok := ForClient(client); ok && h.Unsure == "" {
+	if h, ok := ForClient(client); ok && !NamedByClient(h) {
 		return h.ID
 	}
 	id := slug(client)
 	for _, h := range all {
-		if h.Unsure != "" {
+		if NamedByClient(h) {
 			continue
 		}
 		if id == h.ID || strings.HasPrefix(id, h.ID+"-") {
@@ -630,6 +675,29 @@ func slug(name string) string {
 // toShell is how InstallCommand runs the script it downloads.
 const toShell = " | sh"
 
+// installerURL, when set, is where install commands fetch the scripts
+// from: a published release of the installers (WAKESHIFT_INSTALLER_URL;
+// docs/dependencies.md, "Signed installers").
+var installerURL atomic.Pointer[string]
+
+// SetInstallerURL makes install commands fetch each script, <harness>.sh,
+// from u instead of the Wakeshift's own /install. The scripts there must
+// pin this Wakeshift as their issuer, so only the Wakeshift the release was
+// built for sets it. "" goes back to /install.
+func SetInstallerURL(u string) {
+	u = strings.TrimSuffix(u, "/")
+	installerURL.Store(&u)
+}
+
+// ScriptURL is where a harness's install script is fetched from: the
+// installers' release (SetInstallerURL), else the Wakeshift at base.
+func ScriptURL(h Harness, base string) string {
+	if u := installerURL.Load(); u != nil && *u != "" {
+		return *u + "/" + h.ID + ".sh"
+	}
+	return strings.TrimSuffix(base, "/") + "/install/" + h.ID + ".sh"
+}
+
 // InstallCommand is the command that installs Wakeshift's hooks for a
 // harness from the Wakeshift at base ("" if it has none).
 func InstallCommand(h Harness, base string) string {
@@ -640,7 +708,7 @@ func InstallCommand(h Harness, base string) string {
 	if h.allowTools != "" {
 		sh = " | " + h.allowTools + " sh"
 	}
-	return "curl -fsSL " + strings.TrimSuffix(base, "/") + "/install/" + h.ID + ".sh" + sh
+	return "curl -fsSL " + ScriptURL(h, base) + sh
 }
 
 // AllowToolsEnv is the variable an install command sets for the installer

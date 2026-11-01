@@ -91,7 +91,9 @@ func (f *wakeCore) handler(w http.ResponseWriter, r *http.Request) {
 		}
 		reply(map[string]any{"text": "Wakeshift: this conversation is woken by Monitor.", "trailer": testTrailer, "meta": map[string]any{"wakeshift/connector": "tok", "other": "x"}})
 	case "/event-subscriptions/unsubscribe":
-		reply(map[string]any{"ended": true})
+		// addition: what unsubscribe_events adds (a wrapped tool's
+		// call.unsubscribe doesn't read it: /calls/addition says it).
+		reply(map[string]any{"ended": true, "addition": map[string]any{"text": "Keep passing session_key."}})
 	case "/event-subscriptions/list":
 		reply(map[string]any{"subscriptions": f.native})
 	case "/event-subscriptions/end":
@@ -923,6 +925,16 @@ func TestAttachTools(t *testing.T) {
 		}
 	}()
 	newWrapped(t, appkit.AttachOptions{Tools: []string{"subscribe"}})
+}
+
+// unsubscribe_events adds what Wakeshift answers the unsubscribe with (that
+// the conversation's session key stays the same) after its own reply.
+func TestUnsubscribeEventsAddsWakeshiftsNote(t *testing.T) {
+	w := newWrapped(t, appkit.AttachOptions{})
+	res := w.callTool(t, "ada", "", "unsubscribe_events", map[string]any{"event": "table.news", "arguments": map[string]any{"table": "oak"}, "session_key": "wsc_s1"}, nil)
+	if res.IsError || res.RPCError != nil || strings.Join(res.texts(), "|") != "Stopped table.news {\"table\":\"oak\"}.\n\nKeep passing session_key." {
+		t.Fatalf("unsubscribe_events: %q", res.texts())
+	}
 }
 
 // session_key is the one name for the session argument: session, its old

@@ -282,6 +282,8 @@ func (a *App) eventTools(at *Attachment, tools map[string]bool) []adapt.Tool {
 			args := t.knownJSON(json.RawMessage(compact(in.Arguments)))
 			var out struct {
 				Ended bool `json:"ended"`
+				// Addition: the conversation's session key stays the same.
+				Addition addition `json:"addition"`
 			}
 			if err := a.eventsCall(ctx, "POST", "/api/apps/v1/event-subscriptions/unsubscribe",
 				map[string]any{"call": callOf(ctx, req, in.WakeArgs), "name": t.name, "arguments": args}, &out); err != nil {
@@ -291,7 +293,7 @@ func (a *App) eventTools(at *Attachment, tools map[string]bool) []adapt.Tool {
 			if out.Ended {
 				key = "unsubscribed"
 			}
-			return textResult(fill(key, "{event}", t.name, "{arguments}", string(args)), false)
+			return out.Addition.result(fill(key, "{event}", t.name, "{arguments}", string(args)))
 		}})
 	// list_subscriptions only reads: marked so (readOnlyHint), clients that
 	// approve read-only tools without asking (Codex, by default) don't ask.

@@ -1,0 +1,71 @@
+name: Release
+
+# A tag v<version> (made by Wakeshift's opensource/tag-go.sh, and pushed by
+# hand) is the release: Go fetches the module through proxy.golang.org, and
+# sum.golang.org records its checksum, so the tag must never move. This
+# checks the tag is the CHANGELOG's newest entry, asks the proxy for it so
+# it's fetchable at once, and makes a GitHub release with the CHANGELOG's
+# notes and a CycloneDX SBOM of the module's dependencies.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Check, SBOM and GitHub release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: The tag is the CHANGELOG's newest entry
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          top=$(sed -n 's/^## \(v[^ ]*\) .*/\1/p' CHANGELOG.md | head -n 1)
+          if [ "$TAG" != "$top" ]; then
+            echo "tag $TAG isn't the CHANGELOG's newest entry ($top)" >&2
+            exit 1
+          fi
+          mkdir -p release
+          awk -v v="$TAG" '
+            $0 ~ "^## " { if (on) exit; if (index($0, "## " v " (") == 1) { on = 1; next } }
+            on { print }
+          ' CHANGELOG.md >release/notes.md
+      - run: go vet ./...
+      - run: go build ./...
+      - name: SBOM
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
+          "$(go env GOPATH)/bin/cyclonedx-gomod" mod -licenses -json -output "release/wakeshift-go-$TAG.cdx.json"
+      - name: The proxy has it
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          for _ in 1 2 3 4 5; do
+            if curl -fsS "https://proxy.golang.org/github.com/wakeshift/wakeshift-go/@v/$TAG.info"; then exit 0; fi
+            sleep 10
+          done
+          echo "proxy.golang.org doesn't have $TAG yet; it fetches it on the next request" >&2
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$TAG" --notes-file release/notes.md release/*.cdx.json

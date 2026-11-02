@@ -31,6 +31,8 @@ import (
 	"log/slog"
 	"net/http"
 	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -250,6 +252,9 @@ type callScope struct {
 	armed    bool   // a subscribe made or renewed a subscription
 	created  []createdSub
 	native   []nativeLine
+	// notes are Wakeshift's from the call's unsubscribes (one that ended
+	// nothing because the call passed no session key), for the block.
+	notes []string
 }
 
 // createdSub is a subscription the call made: ended if the call fails.
@@ -468,9 +473,15 @@ func (e *DefinedEvent[A, P]) Unsubscribe(ctx context.Context, call *ToolCall, ar
 	}
 	var out struct {
 		Ended bool `json:"ended"`
+		// Addition: the call passed no session key, so it ended nothing;
+		// the block says to call again with it.
+		Addition addition `json:"addition"`
 	}
 	err = e.app.eventsCall(ctx, "POST", "/api/apps/v1/event-subscriptions/unsubscribe",
 		map[string]any{"call": wire, "name": e.t.name, "arguments": known}, &out)
+	if note := strings.TrimSpace(out.Addition.Text); err == nil && note != "" && !slices.Contains(s.notes, note) {
+		s.notes = append(s.notes, note)
+	}
 	return out.Ended, err
 }
 

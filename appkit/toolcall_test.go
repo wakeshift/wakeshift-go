@@ -33,13 +33,14 @@ const testTrailer = "(For Wakeshift's hook on this computer, not for you: wakesh
 
 // wakeCore answers the app API's calls the wrapper makes, and records them.
 type wakeCore struct {
-	mu       sync.Mutex
-	calls    []wakeCoreCall
-	subs     int
-	seen     map[string]bool
-	addition map[string]any // /calls/addition's answer
-	fail     map[string]bool
-	native   []appkit.EventSubscription
+	mu          sync.Mutex
+	calls       []wakeCoreCall
+	subs        int
+	seen        map[string]bool
+	addition    map[string]any // /calls/addition's answer
+	unsubscribe map[string]any // /event-subscriptions/unsubscribe's, if set
+	fail        map[string]bool
+	native      []appkit.EventSubscription
 }
 
 type wakeCoreCall struct {
@@ -91,9 +92,17 @@ func (f *wakeCore) handler(w http.ResponseWriter, r *http.Request) {
 		}
 		reply(map[string]any{"text": "Wakeshift: this conversation is woken by Monitor.", "trailer": testTrailer, "meta": map[string]any{"wakeshift/connector": "tok", "other": "x"}})
 	case "/event-subscriptions/unsubscribe":
-		// addition: what unsubscribe_events adds (a wrapped tool's
-		// call.unsubscribe doesn't read it: /calls/addition says it).
-		reply(map[string]any{"ended": true, "addition": map[string]any{"text": "Keep passing session_key."}})
+		// addition: what unsubscribe_events adds (the core sends a wrapped
+		// tool's only when the call passed no key: f.unsubscribe).
+		if f.unsubscribe != nil {
+			reply(f.unsubscribe)
+			return
+		}
+		if call["tool"] == "unsubscribe_events" {
+			reply(map[string]any{"ended": true, "addition": map[string]any{"text": "Keep passing session_key."}})
+			return
+		}
+		reply(map[string]any{"ended": true})
 	case "/event-subscriptions/list":
 		reply(map[string]any{"subscriptions": f.native})
 	case "/event-subscriptions/end":
@@ -934,6 +943,49 @@ func TestUnsubscribeEventsAddsWakeshiftsNote(t *testing.T) {
 	res := w.callTool(t, "ada", "", "unsubscribe_events", map[string]any{"event": "table.news", "arguments": map[string]any{"table": "oak"}, "session_key": "wsc_s1"}, nil)
 	if res.IsError || res.RPCError != nil || strings.Join(res.texts(), "|") != "Stopped table.news {\"table\":\"oak\"}.\n\nKeep passing session_key." {
 		t.Fatalf("unsubscribe_events: %q", res.texts())
+	}
+}
+
+// A wrapped tool's Unsubscribe that Wakeshift answers with a note (the
+// call passed no session key, so nothing ended) puts it first in the
+// call's block, even when nothing names the conversation and no block
+// would be asked for.
+func TestUnsubscribeWithoutTheKeyNoteInTheBlock(t *testing.T) {
+	const note = "Wakeshift: nothing was unsubscribed. Call this tool again with the session_key you were given."
+	w := newWrapped(t, appkit.AttachOptions{})
+	var ended []bool
+	mcp.AddTool(w.srv, &mcp.Tool{Name: "unwatch"}, appkit.Events(w.at, func(ctx context.Context, call *appkit.ToolCall, in tableIn) (*mcp.CallToolResult, any, error) {
+		ok, err := w.shared.Unsubscribe(ctx, call, tableArgs{Table: in.Table})
+		ended = append(ended, ok)
+		text := "Stopped watching."
+		if !ok {
+			text = "This chat wasn't watching."
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, nil, err
+	}))
+	w.core.unsubscribe = map[string]any{"ended": false, "addition": map[string]any{"text": note}}
+	w.core.reset()
+	res := w.callTool(t, "ada", "", "unwatch", map[string]any{"table": "oak"}, nil)
+	if got := strings.Join(res.texts(), "|"); res.IsError || got != "This chat wasn't watching.|"+note {
+		t.Fatalf("keyless: %q", got)
+	}
+	if want := []string{"/event-subscriptions/unsubscribe"}; !eqStrings(w.core.paths(), want) {
+		t.Fatalf("keyless: requests %v", w.core.paths())
+	}
+	w.core.reset()
+	res = w.callTool(t, "ada", "", "unwatch", map[string]any{"table": "oak", "session_key": "wsc_s1"}, nil)
+	if got := strings.Join(res.texts(), "|"); got != "This chat wasn't watching.|"+note+"\n\nWakeshift: this conversation is woken by Monitor.|"+testTrailer {
+		t.Fatalf("with a block: %q", got)
+	}
+	// No note: no block for a keyless call, as before.
+	w.core.unsubscribe = nil
+	w.core.reset()
+	res = w.callTool(t, "ada", "", "unwatch", map[string]any{"table": "oak"}, nil)
+	if got := strings.Join(res.texts(), "|"); got != "Stopped watching." {
+		t.Fatalf("no note: %q", got)
+	}
+	if len(ended) != 3 || ended[0] || !ended[2] {
+		t.Fatalf("ended: %v", ended)
 	}
 }
 

@@ -118,7 +118,19 @@ func (at *Attachment) rollback(ctx context.Context, s *callScope) {
 // to. A call that names no conversation, and subscribed nothing, gets
 // nothing (has false). Only a failure for a call that subscribed is
 // returned: without a subscription, the block is a courtesy.
+//
+// Notes from the call's unsubscribes come first, whatever else it gets.
 func (at *Attachment) blockFor(ctx context.Context, s *callScope) (blk adapt.Block, has bool, err error) {
+	blk, has, err = at.fetchBlock(ctx, s)
+	if err != nil || len(s.notes) == 0 {
+		return blk, has, err
+	}
+	blk.Text = strings.TrimSpace(strings.Join(s.notes, " ") + "\n\n" + blk.Text)
+	return blk, true, nil
+}
+
+// fetchBlock is the call's block from /calls/addition (blockFor).
+func (at *Attachment) fetchBlock(ctx context.Context, s *callScope) (blk adapt.Block, has bool, err error) {
 	wire := s.call.wire()
 	if s.pending == "" && len(s.native) == 0 && wire.Session == "" && wire.Conversation == "" && conversationKey(wire.Meta) == "" {
 		return adapt.Block{}, false, nil

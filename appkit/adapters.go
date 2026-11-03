@@ -44,7 +44,26 @@ func (bridge) Begin(ctx context.Context, at *Attachment, r adapt.Request, args W
 	s := at.newScope(r)
 	ctx = context.WithValue(ctx, scopeKey{}, s)
 	s.begin(ctx, args)
+	s.declared, _ = at.declaredName(r.Tool)
 	return ctx, s.call
+}
+
+// Declare records the events the tool named name declares (opts'
+// Subscribes; none without): its calls are checked against them, and
+// Describe describes it. It panics on another app's event, as Events does.
+func (bridge) Declare(at *Attachment, name string, opts []EventsOption) {
+	at.declareName(name, at.declarationOf("mcpgo.Events", opts))
+}
+
+// Describe is a tool's description as tools/list gives it: with the
+// subscribes sentence if the tool declares events (Declare), and the app
+// named as the console has it in a Notifies or subscribes sentence that
+// says "this app".
+func (bridge) Describe(ctx context.Context, at *Attachment, name, description string) string {
+	if d, _ := at.declaredName(name); d != nil && len(d.events) > 0 {
+		description = withSubscribes(description, d.descriptions(), "")
+	}
+	return at.nameDescription(ctx, description)
 }
 
 // End closes the call to further subscribes, once its handler has returned.

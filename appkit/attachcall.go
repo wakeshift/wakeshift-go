@@ -32,6 +32,8 @@ func (at *Attachment) middleware(next mcp.MethodHandler) mcp.MethodHandler {
 		if method == "tools/list" {
 			res, err = next(ctx, method, req)
 			if list, ok := res.(*mcp.ListToolsResult); ok && err == nil {
+				lr, _ := req.(*mcp.ListToolsRequest)
+				at.describeTools(list, list.NextCursor == "" && (lr == nil || lr.Params == nil || lr.Params.Cursor == ""))
 				amendTools(list)
 				at.nameApp(ctx, list)
 			}

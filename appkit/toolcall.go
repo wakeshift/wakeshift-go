@@ -154,13 +154,27 @@ func Label(l string) SubscribeOption { return func(o *subscribeOptions) { o.labe
 // passed to it; register Attach after the server's own receiving
 // middleware, so its block stays last.
 //
+// Subscribes declares the events the handler subscribes to: tools/list then
+// says the tool is how the app notifies the agent of them, and a Subscribe
+// to an event the tool doesn't declare warns (from the next release, it
+// returns an error).
+//
+//	mcp.AddTool(srv, &mcp.Tool{Name: "watch_build", Description: "Watch a build until it finishes."},
+//		appkit.Events(attached, watchBuild, appkit.Subscribes(buildFinished)))
+//
 // In must embed WakeArgs. A structured result (Out not any, or a
 // CallToolResult with StructuredContent an object) carries the block's text
 // in its wakeshift field too, and tools/list names the field in the tool's
 // output schema; embedding WakeOutput in Out declares it in the type.
-func Events[In WakeInput, Out any](at *Attachment, h func(context.Context, *ToolCall, In) (*mcp.CallToolResult, Out, error)) mcp.ToolHandlerFor[In, Out] {
+func Events[In WakeInput, Out any](at *Attachment, h func(context.Context, *ToolCall, In) (*mcp.CallToolResult, Out, error), opts ...EventsOption) mcp.ToolHandlerFor[In, Out] {
 	if at == nil || h == nil {
 		panic("appkit.Events: needs the Attachment Attach returned, and a handler")
+	}
+	decl, name := at.declarationAndName("appkit.Events", opts)
+	if name != "" {
+		at.declareName(name, decl)
+	} else {
+		at.declareShape(shapeKeyFor[In](), decl)
 	}
 	var zero Out
 	return func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
@@ -169,6 +183,9 @@ func Events[In WakeInput, Out any](at *Attachment, h func(context.Context, *Tool
 			return nil, zero, errNotAttached
 		}
 		s.begin(ctx, in.wakeArgs())
+		s.declared = decl
+		// Now its name is known: tools/list finds it by name from here on.
+		at.declareName(s.req.Tool, decl)
 		defer s.end()
 		return h(ctx, s.call, in)
 	}
@@ -255,6 +272,8 @@ type callScope struct {
 	// notes are Wakeshift's from the call's unsubscribes (one that ended
 	// nothing because the call passed no session key), for the block.
 	notes []string
+	// declared is the events the tool declares (Subscribes; nil: none).
+	declared *declaration
 }
 
 // createdSub is a subscription the call made: ended if the call fails.
@@ -385,6 +404,9 @@ func (e *DefinedEvent[A, P]) Subscribe(ctx context.Context, call *ToolCall, args
 	defer s.leave()
 	if s.at.app != e.app {
 		return Subscription{}, otherAppsEvent(e.t.name)
+	}
+	if err := s.checkDeclared(e.t); err != nil {
+		return Subscription{}, err
 	}
 	argsJSON, err := json.Marshal(args)
 	if err != nil {

@@ -2,6 +2,25 @@
 
 What changed in each release of `github.com/wakeshift/wakeshift-go`. v0.4.0 is the first published release: to start with it, read the [README](README.md). Its notes below, and the earlier releases', are for apps that ran the preview builds.
 
+## v0.8.0 (2026-11-03)
+
+### Added
+
+- **`appkit.Subscribes(events…)`: declare the events a tool subscribes to.** Pass it to `appkit.Events` (`appkit.Events(attached, handler, appkit.Subscribes(buildFinished))`) or `mcpgo.Events`. tools/list then adds a sentence to the tool's description, built from each event's own description, the same in every SDK: "This tool is how Shipyard notifies you in this conversation of this event: A build finished: it passed, failed or was canceled. Shipyard delivers its notifications through Wakeshift; the result may ask you to start a background listener and to offer the user a one-time install. Follow it." For several events it says "of these events: …; …". The app is named as the console has it, and "this app" without a name. You no longer write the sentence with `Notifies`; in wakebench's realistic tier, the sentence built from the event's description did as well as `Notifies` with `NotifyWhen`. go-sdk doesn't tell `Events` the tool's name, so tools/list finds the tool by the schema its input type gives it: give each subscribing tool its own input type, or name it with `appkit.ToolName` (tools that share one but declare differently get no sentence, with a warning, until each has been called). `mcpgo.Events` knows the tool's name, and its tools/list now names the app in `Notifies` sentences too.
+- **`appkit.ErrIDReused`: an emit's ID used for a different emit is refused.** Wakeshift deduplicated emits on the ID alone, so reusing a `WithID` value by accident (a timestamp or a commit SHA two occurrences share) for another event, other arguments, recipients or payload dropped the second emit silently, and it returned the first's `Matched`, reading as delivered. Now Wakeshift compares what each emit sends: a retry of the same emit with its ID still sends nothing new and returns the first's result with `Duplicate` set, and the same ID on a different emit is refused with `409 id_reused` and sends nothing. `Emit` returns an `*appkit.APIError` with code `id_reused` for it, which `errors.Is(err, appkit.ErrIDReused)` matches (`appkit.IsCode(err, "id_reused")` works too). Recipients compare as a set, so a retry may list them in another order.
+
+### Fixed
+
+- **An emit to one user with nothing subscribed lists them in `Unmatched`.** It returned `Matched: 0` and no `Unmatched`, so the recipient was in neither; an emit to several listed them correctly. Every recipient is now in `Matched`'s count, `Unmatched` or `Ended`, whether the emit names one or many.
+
+### Deprecated
+
+- **A `Subscribe` the tool doesn't declare.** From a tool wrapped without `Subscribes`, or for an event its `Subscribes` doesn't list, `Subscribe` still works but logs a warning, once per tool, naming the tool and the fix (`appkit.Events(attached, handler, appkit.Subscribes(…))`). From the next release it returns an error.
+
+### Changed
+
+- **`appkit.Notifies` is an optional override.** Use it only to word the sentence yourself: a tool whose description already has one gets no second sentence from `Subscribes`. Tools that subscribe still declare their events with `Subscribes`.
+
 ## v0.7.0 (2026-11-03)
 
 ### Added

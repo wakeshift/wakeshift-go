@@ -107,6 +107,16 @@ func (e *APIError) Error() string {
 // Unwrap is the transport's error, for an unreachable core.
 func (e *APIError) Unwrap() error { return e.err }
 
+// ErrIDReused is what errors.Is matches for an Emit whose ID was used
+// within the last day for a different emit (another event, arguments,
+// recipients or payload): an *APIError with Status 409 and Code id_reused.
+// Nothing was sent. A retry of the same emit isn't refused: it returns the
+// first emit's result, with Emitted.Duplicate set.
+var ErrIDReused = errors.New("wakeshift: id_reused")
+
+// Is matches ErrIDReused for Wakeshift's id_reused.
+func (e *APIError) Is(target error) bool { return target == ErrIDReused && e.Code == "id_reused" }
+
 // unreachable is the APIError for a request with ctx through client that
 // got no answer. It names the core it went to: a wrong or missing
 // WAKESHIFT_CORE is the usual cause.

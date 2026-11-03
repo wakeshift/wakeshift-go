@@ -268,18 +268,24 @@ func ToNative(users ...string) EmitOption {
 	}
 }
 
-// WithID makes an Emit idempotent: retrying with the same ID delivers once.
-// A retry must name the same recipients: Wakeshift uses the first's.
+// WithID makes an Emit idempotent for a day: a retry of the same emit
+// (arguments, recipients and payload) with the same ID delivers once and
+// returns the first's result, with Duplicate set. The ID on a different
+// emit is refused with an error that errors.Is ErrIDReused (409
+// id_reused), and nothing is sent: give each occurrence its own ID.
 func WithID(id string) EmitOption { return func(o *emitOptions) { o.id = id } }
 
 // Emitted is what an Emit reached.
 type Emitted struct {
-	// Matched is how many conversations it woke (or will), and webhooks
-	// it went to (0: nobody's subscribed).
-	Matched   int  `json:"matched"`
-	Duplicate bool `json:"duplicate"` // an earlier Emit had this ID
+	// Matched is how many conversations it reached, each woken now or as
+	// soon as its agent can take it, webhooks included (0: nobody's
+	// subscribed).
+	Matched int `json:"matched"`
+	// Duplicate: a retry. An earlier Emit, the same as this one, had its
+	// ID, and this is that emit's result (nothing new was sent).
+	Duplicate bool `json:"duplicate"`
 	// Unmatched are the user and native recipients with no live
-	// subscription it reached (an emit to several recipients only).
+	// subscription it reached, whether it names one or many.
 	Unmatched []Recipient `json:"-"`
 	// Ended are the subscription recipients that are no longer live (or
 	// aren't that user's, or this event's): forget them. A duplicate

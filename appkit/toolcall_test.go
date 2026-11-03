@@ -41,6 +41,7 @@ type wakeCore struct {
 	unsubscribe map[string]any // /event-subscriptions/unsubscribe's, if set
 	fail        map[string]bool
 	native      []appkit.EventSubscription
+	appName     string // GET /app's name ("" answers 404)
 }
 
 type wakeCoreCall struct {
@@ -68,6 +69,12 @@ func (f *wakeCore) handler(w http.ResponseWriter, r *http.Request) {
 	reply := func(v any) { w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(v) }
 	call, _ := body["call"].(map[string]any)
 	switch path {
+	case "/app":
+		if f.appName == "" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		reply(map[string]any{"id": "app_test", "name": f.appName})
 	case "/event-subscriptions":
 		args, _ := json.Marshal(body["arguments"])
 		key := fmt.Sprint(body["name"], string(args))

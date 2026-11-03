@@ -54,6 +54,8 @@ type appkitSide interface {
 	End(c *appkit.ToolCall)
 	Finish(ctx context.Context, c *appkit.ToolCall, failed bool) (blk adapt.Block, has bool, failure string)
 	WarnStructured(c *appkit.ToolCall)
+	Declare(at *appkit.Attachment, name string, opts []appkit.EventsOption)
+	Describe(ctx context.Context, at *appkit.Attachment, name, description string) string
 }
 
 // side is appkit's. The two packages are always built together, from one
@@ -140,6 +142,17 @@ func Attach(app *appkit.App, srv *server.MCPServer, opts AttachOptions) *Attachm
 		server.WithHooks(hooks)(srv)
 	}
 	hooks.AddBeforeCallTool(func(_ context.Context, _ any, req *mcp.CallToolRequest) { dropUndeclared(srv, req) })
+	// tools/list: each tool that declares events (Events' appkit.Subscribes)
+	// says it's how the app notifies the agent, and a Notifies or
+	// subscribes sentence names the app as the console has it.
+	hooks.AddAfterListTools(func(ctx context.Context, _ any, _ *mcp.ListToolsRequest, res *mcp.ListToolsResult) {
+		if res == nil {
+			return
+		}
+		for i := range res.Tools {
+			res.Tools[i].Description = side.Describe(ctx, at, res.Tools[i].Name, res.Tools[i].Description)
+		}
+	})
 	return &Attachment{Attachment: at}
 }
 
@@ -160,10 +173,18 @@ func Attach(app *appkit.App, srv *server.MCPServer, opts AttachOptions) *Attachm
 // Middleware added with srv.Use runs outside the wrapper: it sees the
 // result with the block, whose beacon line must stay last, so don't add
 // content after it there.
-func Events[In appkit.WakeInput](at *Attachment, tool mcp.Tool, h func(ctx context.Context, call *appkit.ToolCall, req mcp.CallToolRequest, in In) (*mcp.CallToolResult, error)) server.ServerTool {
+//
+// appkit.Subscribes declares the events the handler subscribes to, as for
+// appkit.Events: tools/list then says the tool is how the app notifies the
+// agent of them, and a Subscribe to an event the tool doesn't declare warns
+// (from the next release, it returns an error).
+//
+//	srv.AddTools(mcpgo.Events(at, mcp.NewTool("watch_build", mcp.WithDescription("Watch a build until it finishes.")), watchBuild, appkit.Subscribes(buildFinished)))
+func Events[In appkit.WakeInput](at *Attachment, tool mcp.Tool, h func(ctx context.Context, call *appkit.ToolCall, req mcp.CallToolRequest, in In) (*mcp.CallToolResult, error), opts ...appkit.EventsOption) server.ServerTool {
 	if at == nil || h == nil {
 		panic("mcpgo.Events: needs the Attachment Attach returned, and a handler")
 	}
+	side.Declare(at.Attachment, tool.Name, opts)
 	return server.ServerTool{Tool: wakeSchemas(tool), Handler: func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var in In
 		if err := req.BindArguments(&in); err != nil {

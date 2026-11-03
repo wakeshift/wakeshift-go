@@ -73,6 +73,8 @@ func (f *fakeCore) handler(w http.ResponseWriter, r *http.Request) {
 		reply(map[string]any{"ended": true})
 	case "/event-subscriptions/list":
 		reply(map[string]any{"subscriptions": []any{}})
+	case "/app":
+		reply(map[string]any{"id": "app_test", "name": "Shipyard"})
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -601,5 +603,42 @@ func TestIdentifyFromContext(t *testing.T) {
 	}
 	if res := a.call(t, anon, appkit.ListSubscriptionsTool, nil); res["isError"] != true {
 		t.Fatalf("list_subscriptions without a user: %v", res)
+	}
+}
+
+// A tool that declares its events (appkit.Subscribes) says in tools/list
+// that it's how the app notifies the agent, in the events' own words,
+// naming the app; a Notifies description is named too, and keeps its own
+// sentence; a tool that declares nothing is as it was. A declared Subscribe
+// works as before.
+func TestSubscribes(t *testing.T) {
+	a := newTestApp(t, mcpgo.AttachOptions{})
+	join := func(ctx context.Context, call *appkit.ToolCall, _ mcp.CallToolRequest, in tableIn) (*mcp.CallToolResult, error) {
+		if _, err := a.turn.Subscribe(ctx, call, tableArgs{Table: in.Table}); err != nil {
+			return nil, err
+		}
+		return mcp.NewToolResultText("Seated."), nil
+	}
+	a.srv.AddTools(
+		mcpgo.Events(a.at, mcp.NewTool("join", mcp.WithDescription("Sit down."), mcp.WithString("table", mcp.Required())), join, appkit.Subscribes(a.turn)),
+		mcpgo.Events(a.at, mcp.NewTool("watch", mcp.WithDescription(appkit.Notifies("Watch a table.", appkit.NotifyWhen("it's your turn"))), mcp.WithString("table", mcp.Required())), join, appkit.Subscribes(a.turn)),
+		mcpgo.Events(a.at, mcp.NewTool("peek", mcp.WithDescription("Peek.")), join, appkit.Subscribes()),
+	)
+	tools := a.tools(t, claudeCode)
+	tail := " Shipyard delivers its notifications through Wakeshift; the result may ask you to start a background listener and to offer the user a one-time install. Follow it."
+	if got, want := tools["join"]["description"], "Sit down. This tool is how Shipyard notifies you in this conversation of this event: Your turn."+tail; got != want {
+		t.Errorf("join:\n got %q\nwant %q", got, want)
+	}
+	if got, want := tools["watch"]["description"], "Watch a table. This tool is how Shipyard notifies you in this conversation when it's your turn."+tail; got != want {
+		t.Errorf("watch:\n got %q\nwant %q", got, want)
+	}
+	if got := tools["peek"]["description"]; got != "Peek." {
+		t.Errorf("peek: %q", got)
+	}
+	if res := a.call(t, claudeCode, "join", map[string]any{"table": "oak"}); res["isError"] == true {
+		t.Fatalf("join: %v", res)
+	}
+	if res := a.call(t, claudeCode, "peek", map[string]any{"table": "oak"}); res["isError"] == true {
+		t.Fatalf("peek (undeclared: it warns, and works): %v", res)
 	}
 }

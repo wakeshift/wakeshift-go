@@ -76,6 +76,9 @@ type Attachment struct {
 	native   func(context.Context, adapt.Request) bool // EventsOptions.Native, for any library's request
 	warned   sync.Map                                  // warnOnce's keys
 	schemas  sync.Map                                  // *mcp.Tool → its input schema, decoded (undeclared.go)
+
+	declMu sync.Mutex
+	decls  declarations // the wrapped tools' Subscribes (subscribes.go)
 }
 
 // Attach attaches Wakeshift to the app's MCP server: the one call that

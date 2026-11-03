@@ -13,9 +13,9 @@ import (
 )
 
 // The manifest the three SDKs send, and when (sdk/typescript/test/manifest.json):
-// an explicit publish replaces it; the automatic send, only from a process
-// that serves the app's tools (Attach), merges the settings the app
-// published and its events into the one Wakeshift has.
+// an explicit publish replaces it; the automatic send (from a process that
+// serves the app's tools, Attach, or after an emit's unknown_event) merges
+// the settings the app published and its events into the one Wakeshift has.
 func TestManifestGolden(t *testing.T) {
 	type answer struct {
 		Status int             `json:"status"`
@@ -27,9 +27,10 @@ func TestManifestGolden(t *testing.T) {
 			Payload   sampleChat     `json:"payload"`
 		} `json:"emit"`
 		Cases []struct {
-			Name   string   `json:"name"`
-			Define []string `json:"define"`
-			Steps  []struct {
+			Name         string   `json:"name"`
+			Define       []string `json:"define"`
+			UnknownEmits *int     `json:"unknown_emits"`
+			Steps        []struct {
 				Attach   bool      `json:"attach"`
 				Emit     bool      `json:"emit"`
 				Status   bool      `json:"status"`
@@ -57,13 +58,33 @@ func TestManifestGolden(t *testing.T) {
 				Body   any
 			}
 			var (
-				mu    sync.Mutex
-				got   = []request{}
-				reply *answer
+				mu      sync.Mutex
+				got     = []request{}
+				reply   *answer
+				unknown int
 			)
+			if c.UnknownEmits != nil {
+				unknown = *c.UnknownEmits
+			}
 			a, _ := testApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				path := strings.TrimPrefix(r.URL.Path, "/api/apps/v1")
+				if path == "/events/emit" && c.UnknownEmits != nil {
+					mu.Lock()
+					got = append(got, request{r.Method, path, nil})
+					refuse := unknown > 0
+					if refuse {
+						unknown--
+					}
+					mu.Unlock()
+					if refuse {
+						w.WriteHeader(http.StatusNotFound)
+						io.WriteString(w, `{"error": {"code": "unknown_event", "message": "no such event"}}`)
+						return
+					}
+					io.WriteString(w, `{"matched": 0}`)
+					return
+				}
 				if path != "/manifest" && !strings.HasPrefix(path, "/manifest/") {
 					io.WriteString(w, `{"matched": 0, "subscriptions": 0, "connected": 0, "forgotten": false}`)
 					return
@@ -154,6 +175,66 @@ func TestManifestGolden(t *testing.T) {
 				t.Fatalf("manifest requests:\n%s\nwant:\n%s", gb, wb)
 			}
 		})
+	}
+}
+
+// Emits that fail together, before Wakeshift has the event (an app
+// emitting at startup, before any agent has connected), send the manifest
+// once.
+func TestConcurrentUnknownEmitsMergeOnce(t *testing.T) {
+	var (
+		mu                    sync.Mutex
+		known                 bool
+		merges, emits         int
+		release               = make(chan struct{})
+		allRefused, closeOnce = make(chan struct{}), sync.Once{}
+	)
+	const n = 5
+	a, _ := testApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch strings.TrimPrefix(r.URL.Path, "/api/apps/v1") {
+		case "/manifest/merge":
+			<-release // until every first emit has been refused
+			mu.Lock()
+			merges++
+			known = true
+			mu.Unlock()
+			io.WriteString(w, `{}`)
+		case "/events/emit":
+			mu.Lock()
+			emits++
+			refuse := !known
+			if emits == n {
+				closeOnce.Do(func() { close(allRefused) })
+			}
+			mu.Unlock()
+			if refuse {
+				w.WriteHeader(http.StatusNotFound)
+				io.WriteString(w, `{"error": {"code": "unknown_event", "message": "no such event"}}`)
+				return
+			}
+			io.WriteString(w, `{"matched": 0}`)
+		}
+	}))
+	chat := defineSample(t, a, "chat.message").(*DefinedEvent[sampleChatArgs, sampleChat])
+	go func() { <-allRefused; close(release) }()
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for range n {
+		wg.Go(func() {
+			_, err := chat.Emit(context.Background(), sampleChatArgs{Channel: "eng"}, sampleChat{From: "ada", Text: "shipped"})
+			errs <- err
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if merges != 1 || emits != 2*n {
+		t.Fatalf("%d merges and %d emits, want 1 and %d", merges, emits, 2*n)
 	}
 }
 

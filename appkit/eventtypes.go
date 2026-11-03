@@ -438,7 +438,9 @@ func (e *DefinedEvent[A, P]) Status(ctx context.Context, args A, opts ...EmitOpt
 // Emit sends one occurrence: to everyone subscribed with arguments that
 // match args (a personal event: to its recipients, To, ToSubscription and
 // ToNative, at most 1,000 in one Emit). The payload is checked against the
-// event's schema.
+// event's schema. If Wakeshift doesn't know the event yet, as when the app
+// emits at startup before any agent has connected, Emit sends the
+// manifest (merged, so it removes nothing) and emits once more.
 func (e *DefinedEvent[A, P]) Emit(ctx context.Context, args A, payload P, opts ...EmitOption) (Emitted, error) {
 	o := emitOptionsOf(opts)
 	switch {
@@ -476,7 +478,20 @@ func (e *DefinedEvent[A, P]) Emit(ctx context.Context, args A, payload P, opts .
 		Unmatched []json.RawMessage `json:"unmatched"`
 		Ended     []json.RawMessage `json:"ended"`
 	}
-	err = e.app.eventsCall(ctx, "POST", "/api/apps/v1/events/emit", body, &out)
+	if err := e.app.ensureManifest(ctx); err != nil {
+		return Emitted{}, err
+	}
+	// Wakeshift may not have the event yet (an emit at startup, before any
+	// agent has connected to the app's server): merge this process's
+	// manifest, then emit once more.
+	seen := e.app.sendCount()
+	err = e.app.appCall(ctx, "POST", "/api/apps/v1/events/emit", body, &out)
+	if isUnknownEvent(err) {
+		if err := e.app.resendManifest(ctx, seen); err != nil {
+			return Emitted{}, err
+		}
+		err = e.app.appCall(ctx, "POST", "/api/apps/v1/events/emit", body, &out)
+	}
 	res := out.Emitted
 	res.Unmatched, res.Ended = recipientsOf(out.Unmatched), recipientsOf(out.Ended)
 	return res, err

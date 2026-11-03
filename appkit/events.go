@@ -158,7 +158,8 @@ func (a *App) attach(identify func(context.Context, *auth.TokenInfo) Identity, n
 	}
 	at := &Attachment{app: a, identify: identify, native: native}
 	// A process that serves the app's tools sends the manifest
-	// automatically (manifest.go); one that only emits never does.
+	// automatically (manifest.go); one that only emits sends it only when
+	// Wakeshift doesn't know an event it emits.
 	a.mu.Lock()
 	a.attached = true
 	a.mu.Unlock()

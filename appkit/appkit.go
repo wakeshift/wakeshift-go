@@ -60,13 +60,20 @@ type App struct {
 	// (nil for nothing), whether this process serves the app's tools
 	// (Attach: only then is the manifest sent automatically), and whether
 	// Wakeshift has the manifest for the event types defined now (sent at
-	// generation sentGen; DefineEvent moves gen on). sendMu makes one send
-	// at a time.
+	// generation sentGen; DefineEvent moves gen on), and how many manifests
+	// Wakeshift has taken from this process. sendMu makes one send at a
+	// time.
 	sendMu       sync.Mutex
 	base         *Manifest
 	attached     bool
 	gen, sentGen uint64
 	sent         bool
+	sends        uint64
+
+	// The app's name, as the console has it (GET /app), once Wakeshift has
+	// said it: what Notifies' sentence names in tools/list.
+	nameMu sync.Mutex
+	name   string
 }
 
 // APIError is an error response from Wakeshift, or a mistake the SDK

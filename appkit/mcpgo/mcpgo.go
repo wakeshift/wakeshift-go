@@ -291,13 +291,10 @@ func requestOf(ctx context.Context, req mcp.CallToolRequest) adapt.Request {
 // builtinTool is one of Attach's own tools for srv.AddTools.
 func builtinTool(t adapt.Tool) server.ServerTool {
 	schema, _ := json.Marshal(t.InputSchema)
-	tool := mcp.Tool{Name: t.Name, Description: t.Description, RawInputSchema: schema}
-	if t.ReadOnly {
-		tool.Annotations.ReadOnlyHint = &t.ReadOnly
-	}
-	if t.Idempotent {
-		tool.Annotations.IdempotentHint = &t.Idempotent
-	}
+	a := t.Annotations
+	tool := mcp.Tool{Name: t.Name, Description: t.Description, RawInputSchema: schema,
+		Annotations: mcp.ToolAnnotation{Title: a.Title, ReadOnlyHint: &a.ReadOnly, DestructiveHint: &a.Destructive,
+			IdempotentHint: &a.Idempotent, OpenWorldHint: &a.OpenWorld}}
 	return server.ServerTool{Tool: tool, Handler: func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		out := t.Run(ctx, requestOf(ctx, req), rawArguments(req))
 		res := &mcp.CallToolResult{Content: []mcp.Content{}, IsError: out.IsError}

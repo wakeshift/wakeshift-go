@@ -11,6 +11,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -511,9 +514,6 @@ func TestDiscoverAndBuiltinTools(t *testing.T) {
 			t.Fatalf("no %s: %v", name, tools)
 		}
 	}
-	if ann, _ := tools[appkit.ListSubscriptionsTool]["annotations"].(map[string]any); ann["readOnlyHint"] != true || ann["idempotentHint"] != true {
-		t.Fatalf("list_subscriptions' annotations: %v", ann)
-	}
 	evs, rpcErr := a.rpc(t, claudeCode, "events/list", nil)
 	if rpcErr != nil || len(evs["events"].([]any)) != 1 {
 		t.Fatalf("events/list: %v %v", evs, rpcErr)
@@ -524,6 +524,36 @@ func TestDiscoverAndBuiltinTools(t *testing.T) {
 	}
 	if strings.Join(a.core.paths(), ",") != "/event-subscriptions" {
 		t.Fatalf("requests: %v", a.core.paths())
+	}
+}
+
+// tools/list gives Attach's own tools and the wait tool exactly the
+// annotations every SDK gives (tool-annotations.json): a title and all four
+// hints.
+func TestBuiltinToolAnnotations(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "sdk", "typescript", "test", "tool-annotations.json")
+	if _, err := os.Stat(path); err != nil {
+		path = filepath.Join("..", "testdata", "golden", "tool-annotations.json")
+	}
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		t.Skip("no shared golden files here")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want map[string]any
+	if err := json.Unmarshal(b, &want); err != nil {
+		t.Fatal(err)
+	}
+	c := claudeCode
+	c.tasks = true
+	got := map[string]any{}
+	for name, tool := range newTestApp(t, mcpgo.AttachOptions{Tools: appkit.Tools{Wait: appkit.Wait{Enabled: true}}}).tools(t, c) {
+		got[name] = tool["annotations"]
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("tools/list's annotations\n got %v\nwant %v", got, want)
 	}
 }
 

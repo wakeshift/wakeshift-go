@@ -66,6 +66,7 @@ func waitToolDefinition() map[string]any {
 		"name":        WaitTool,
 		"description": harnesses.WaitToolDescription,
 		"inputSchema": map[string]any{"type": "object", "properties": props, "additionalProperties": false},
+		"annotations": toolAnnotations[WaitTool].Wire(),
 	}
 }
 

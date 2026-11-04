@@ -51,9 +51,24 @@ type Tool struct {
 	Name        string
 	Description string
 	InputSchema map[string]any
-	// ReadOnly and Idempotent are its annotations' hints.
-	ReadOnly, Idempotent bool
-	Run                  func(ctx context.Context, req Request, args json.RawMessage) Result
+	// Annotations are its MCP tool annotations: a title and all four
+	// hints, always sent (every SDK sends the same: tool-annotations.json).
+	Annotations Annotations
+	Run         func(ctx context.Context, req Request, args json.RawMessage) Result
+}
+
+// Annotations are a tool's MCP annotations: a human title and the four
+// hints, each always given (true or false), so a client or an app store
+// never falls back to the spec's defaults (destructive, open world).
+type Annotations struct {
+	Title                                        string
+	ReadOnly, Destructive, Idempotent, OpenWorld bool
+}
+
+// Wire is the annotations as tools/list gives them.
+func (a Annotations) Wire() map[string]any {
+	return map[string]any{"title": a.Title, "readOnlyHint": a.ReadOnly, "destructiveHint": a.Destructive,
+		"idempotentHint": a.Idempotent, "openWorldHint": a.OpenWorld}
 }
 
 // Block is what Wakeshift adds to a wrapped tool's result: Text as a block

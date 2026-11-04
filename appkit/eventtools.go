@@ -26,6 +26,34 @@ const (
 	ListSubscriptionsTool = "list_subscriptions"
 )
 
+// toolAnnotations are the MCP annotations of Attach's own tools and the wait
+// tool: a title and all four hints, so app stores (ChatGPT's) and clients
+// see each stated rather than the spec's defaults (destructive, open
+// world). Every SDK gives the same: sdk/typescript/test/tool-annotations.json
+// (TestToolAnnotationsGolden).
+var toolAnnotations = map[string]adapt.Annotations{
+	// Idempotent: the core keeps one subscription per conversation, event
+	// and arguments, so a second call renews that one ("renewed") rather
+	// than making another.
+	SubscribeEventsTool: {Title: "Subscribe to events", Idempotent: true},
+	// Not destructive (MCP: "may perform destructive updates"): it ends
+	// only the caller's own subscriptions, and ending one is reversible.
+	// The conversation's own come back with subscribe_events; one ended by
+	// id may deliver to a webhook or be polled, which whoever made it can
+	// make again. The record is marked ended, not deleted.
+	// Idempotent: a second call ends nothing and says so (not_subscribed,
+	// no_such_id), without an error.
+	UnsubscribeEventsTool: {Title: "Unsubscribe from events", Idempotent: true},
+	// Only reads: clients that approve read-only tools without asking
+	// (Codex, by default) don't ask.
+	ListSubscriptionsTool: {Title: "List subscriptions", ReadOnly: true, Idempotent: true},
+	// Not read-only or idempotent: each call confirms (acks) the messages
+	// the previous wait handed over and starts a new wait in its place, so
+	// a second call differs from the first. Not destructive: it confirms
+	// only messages already given to this conversation, and drops none.
+	WaitTool: {Title: "Wait for messages"},
+}
+
 // Tools picks which of Attach's own tools it adds (AttachOptions.Tools).
 // Its zero value is the default: subscribe_events, unsubscribe_events and
 // list_subscriptions on, and the wait tool off. So the three that are on by
@@ -190,10 +218,10 @@ func detailOf(err error) string {
 
 // goSDKTool is one of Attach's own tools for go-sdk's Server.AddTool.
 func goSDKTool(t adapt.Tool) (*mcp.Tool, mcp.ToolHandler) {
-	tool := &mcp.Tool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema}
-	if t.ReadOnly || t.Idempotent {
-		tool.Annotations = &mcp.ToolAnnotations{ReadOnlyHint: t.ReadOnly, IdempotentHint: t.Idempotent}
-	}
+	a := t.Annotations
+	tool := &mcp.Tool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema,
+		Annotations: &mcp.ToolAnnotations{Title: a.Title, ReadOnlyHint: a.ReadOnly, DestructiveHint: &a.Destructive,
+			IdempotentHint: a.Idempotent, OpenWorldHint: &a.OpenWorld}}
 	return tool, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var args json.RawMessage
 		if req.Params != nil {
@@ -245,6 +273,7 @@ func (a *App) eventTools(at *Attachment, tools map[string]bool) []adapt.Tool {
 		add(adapt.Tool{Name: SubscribeEventsTool, Description: eventTools["subscribe_description"] + eventTools["events_heading"] + eventsListing(types),
 			InputSchema: toolSchema(map[string]any{"event": map[string]any{"type": "string", "enum": names, "description": eventTools["event_argument"]},
 				"arguments": argsProp}, "event"),
+			Annotations: toolAnnotations[SubscribeEventsTool],
 			Run: func(ctx context.Context, req adapt.Request, raw json.RawMessage) adapt.Result {
 				var in struct {
 					Event     string          `json:"event"`
@@ -284,6 +313,7 @@ func (a *App) eventTools(at *Attachment, tools map[string]bool) []adapt.Tool {
 	add(adapt.Tool{Name: UnsubscribeEventsTool, Description: eventTools["unsubscribe_description"],
 		InputSchema: toolSchema(map[string]any{"event": map[string]any{"type": "string", "enum": names, "description": eventTools["event_argument"]},
 			"arguments": argsProp, "id": map[string]any{"type": "string", "description": eventTools["id_argument"]}}),
+		Annotations: toolAnnotations[UnsubscribeEventsTool],
 		Run: func(ctx context.Context, req adapt.Request, raw json.RawMessage) adapt.Result {
 			var in struct {
 				ID        string          `json:"id"`
@@ -326,13 +356,8 @@ func (a *App) eventTools(at *Attachment, tools map[string]bool) []adapt.Tool {
 			}
 			return out.Addition.result(fill(key, "{event}", t.name, "{arguments}", string(args)))
 		}})
-	// list_subscriptions only reads: marked so (readOnlyHint), clients that
-	// approve read-only tools without asking (Codex, by default) don't ask.
-	// idempotentHint is true, as in every SDK (the shared golden file
-	// events-list.json): Go's MCP SDK always sends it, and false would say
-	// that calling it twice differs.
 	add(adapt.Tool{Name: ListSubscriptionsTool, Description: eventTools["list_description"], InputSchema: toolSchema(nil),
-		ReadOnly: true, Idempotent: true,
+		Annotations: toolAnnotations[ListSubscriptionsTool],
 		Run: func(ctx context.Context, req adapt.Request, _ json.RawMessage) adapt.Result {
 			u := user(ctx, req)
 			if u == "" {

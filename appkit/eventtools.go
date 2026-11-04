@@ -513,16 +513,33 @@ func namedIn(description, name string) string {
 	return strings.NewReplacer(first, strings.Replace(first, unnamedApp, name, 1), second, strings.Replace(second, "This app", strings.ToUpper(name[:1])+name[1:], 1)).Replace(description)
 }
 
-// appName is the app's name as the console has it, asked of Wakeshift once
-// (again after a failure); "" if Wakeshift doesn't give one.
+// nameFetch is how long tools/list waits for the app's name (GET /app)
+// before saying "this app", and how long after a failed or unanswered
+// fetch it doesn't ask again. Tests shorten them.
+var nameFetch = struct{ wait, retry time.Duration }{3 * time.Second, time.Minute}
+
+// appName is the app's name as the console has it, asked of Wakeshift once;
+// "" if Wakeshift doesn't give one, or doesn't answer within nameFetch.wait.
+// After a failure it isn't asked again for nameFetch.retry, so a slow or
+// failing Wakeshift neither stalls nor multiplies tools/list.
 func (a *App) appName(ctx context.Context) string {
 	a.nameMu.Lock()
 	defer a.nameMu.Unlock()
-	if a.name != "" {
+	if a.nameKnown {
 		return a.name
 	}
-	if info, err := a.Info(ctx); err == nil {
-		a.name = strings.TrimSpace(info.Name)
+	if !a.nameFailed.IsZero() && time.Since(a.nameFailed) < nameFetch.retry {
+		return ""
 	}
+	// Not the request's cancellation: a client that gives up on one
+	// tools/list mustn't keep the next from being named.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nameFetch.wait)
+	defer cancel()
+	info, err := a.Info(ctx)
+	if err != nil {
+		a.nameFailed = time.Now()
+		return ""
+	}
+	a.name, a.nameKnown = strings.TrimSpace(info.Name), true
 	return a.name
 }

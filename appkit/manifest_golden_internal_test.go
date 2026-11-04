@@ -3,11 +3,13 @@ package appkit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -235,6 +237,50 @@ func TestConcurrentUnknownEmitsMergeOnce(t *testing.T) {
 	}
 	if merges != 1 || emits != 2*n {
 		t.Fatalf("%d merges and %d emits, want 1 and %d", merges, emits, 2*n)
+	}
+}
+
+// Calls about events that wait for one manifest send share its outcome:
+// when it fails, they fail with its error rather than each sending again,
+// one after another (with Wakeshift slow, each up to a timeout). The next
+// call sends again.
+func TestFailedManifestSendIsShared(t *testing.T) {
+	var mu sync.Mutex
+	merges := 0
+	a, _ := testApp(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/apps/v1/manifest/merge" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		merges++
+		mu.Unlock()
+		time.Sleep(300 * time.Millisecond) // the others queue meanwhile
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(w, `{"error": {"code": "unavailable", "message": "down"}}`)
+	}))
+	defineSample(t, a, "chat.message")
+	a.attached = true
+	const n = 5
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for range n {
+		wg.Go(func() { errs <- a.ensureManifest(context.Background()) })
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		var e *APIError
+		if !errors.As(err, &e) || e.Code != "unavailable" {
+			t.Fatalf("err = %v, want the send's unavailable", err)
+		}
+	}
+	if merges != 1 {
+		t.Fatalf("%d concurrent calls sent %d merges, want 1", n, merges)
+	}
+	if err := a.ensureManifest(context.Background()); err == nil || merges != 2 {
+		t.Fatalf("the next call: %v, %d merges, want an error and 2", err, merges)
 	}
 }
 

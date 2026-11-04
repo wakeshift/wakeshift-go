@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -177,6 +178,79 @@ func TestSubscribesToolsList(t *testing.T) {
 	mcp.AddTool(w2.srv, &mcp.Tool{Name: "watch", Description: "Watch a table."}, appkit.Events(w2.at, handler[watchIn](nil), appkit.Subscribes(w2.shared)))
 	if got := w2.descriptions(t)["watch"]; got != "Watch a table. "+notifiesSentence("this app", "of this event: News at a table") {
 		t.Fatalf("unnamed: %q", got)
+	}
+}
+
+// tools/list waits only so long for the app's name (GET /app), saying
+// "this app" without it, and doesn't ask again soon after a failure (an
+// unanswered request, an error): a slow or failing Wakeshift neither
+// stalls nor multiplies tools/list. A name it gives, even "", is kept.
+func TestSubscribesAppNameFetchIsBounded(t *testing.T) {
+	defer appkit.SetNameFetch(100*time.Millisecond, time.Minute)()
+	unnamed := "Watch a table. " + notifiesSentence("this app", "of this event: News at a table")
+	appCalls := func(w *wrapped) int {
+		w.core.mu.Lock()
+		defer w.core.mu.Unlock()
+		n := 0
+		for _, c := range w.core.calls {
+			if c.Path == "/app" {
+				n++
+			}
+		}
+		return n
+	}
+	register := func(w *wrapped) {
+		mcp.AddTool(w.srv, &mcp.Tool{Name: "watch", Description: "Watch a table."}, appkit.Events(w.at, handler[watchIn](nil), appkit.Subscribes(w.shared)))
+	}
+
+	// Unanswered: concurrent lists don't queue behind it, and the next ones
+	// don't ask again.
+	slow := newWrapped(t, appkit.AttachOptions{})
+	register(slow)
+	slow.core.mu.Lock()
+	slow.core.appName, slow.core.appDelay = "Shipyard", 10*time.Second
+	slow.core.mu.Unlock()
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if got := slow.descriptions(t)["watch"]; got != unnamed {
+				t.Errorf("slow: %q", got)
+			}
+		}()
+	}
+	wg.Wait()
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("4 concurrent tools/list took %s", d)
+	}
+	slow.descriptions(t)
+	if n := appCalls(slow); n != 1 {
+		t.Fatalf("slow: %d GET /app", n)
+	}
+
+	// Failing: asked once within the retry window, then again after it.
+	failing := newWrapped(t, appkit.AttachOptions{})
+	register(failing)
+	failing.core.mu.Lock()
+	failing.core.fail = map[string]bool{"/app": true}
+	failing.core.mu.Unlock()
+	failing.descriptions(t)
+	failing.descriptions(t)
+	if n := appCalls(failing); n != 1 {
+		t.Fatalf("failing: %d GET /app", n)
+	}
+	defer appkit.SetNameFetch(100*time.Millisecond, 0)()
+	failing.core.mu.Lock()
+	failing.core.fail, failing.core.appName = nil, "Shipyard"
+	failing.core.mu.Unlock()
+	if got := failing.descriptions(t)["watch"]; got != "Watch a table. "+notifiesSentence("Shipyard", "of this event: News at a table") {
+		t.Fatalf("named: %q", got)
+	}
+	failing.descriptions(t)
+	if n := appCalls(failing); n != 2 {
+		t.Fatalf("after the retry window: %d GET /app", n)
 	}
 }
 

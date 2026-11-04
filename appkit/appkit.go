@@ -69,11 +69,19 @@ type App struct {
 	gen, sentGen uint64
 	sent         bool
 	sends        uint64
+	// ensureManifest's sends that finished (failed), and the last one's
+	// error: a call that waited for a send that failed fails with it,
+	// rather than sending again.
+	ensures   uint64
+	ensureErr error
 
 	// The app's name, as the console has it (GET /app), once Wakeshift has
-	// said it: what Notifies' sentence names in tools/list.
-	nameMu sync.Mutex
-	name   string
+	// said it (nameKnown, even if it's ""): what Notifies' sentence names
+	// in tools/list; and when asking last failed or went unanswered.
+	nameMu     sync.Mutex
+	name       string
+	nameKnown  bool
+	nameFailed time.Time
 }
 
 // APIError is an error response from Wakeshift, or a mistake the SDK

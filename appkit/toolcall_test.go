@@ -41,7 +41,8 @@ type wakeCore struct {
 	unsubscribe map[string]any // /event-subscriptions/unsubscribe's, if set
 	fail        map[string]bool
 	native      []appkit.EventSubscription
-	appName     string // GET /app's name ("" answers 404)
+	appName     string        // GET /app's name ("" answers 404)
+	appDelay    time.Duration // how long GET /app takes (or until the caller gives up)
 }
 
 type wakeCoreCall struct {
@@ -52,9 +53,22 @@ type wakeCoreCall struct {
 func (f *wakeCore) handler(w http.ResponseWriter, r *http.Request) {
 	var body map[string]any
 	json.NewDecoder(r.Body).Decode(&body)
+	path := strings.TrimPrefix(r.URL.Path, "/api/apps/v1")
+	f.mu.Lock()
+	delay := f.appDelay
+	f.mu.Unlock()
+	if path == "/app" && delay > 0 {
+		f.mu.Lock()
+		f.calls = append(f.calls, wakeCoreCall{Path: path})
+		f.mu.Unlock()
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+		}
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	path := strings.TrimPrefix(r.URL.Path, "/api/apps/v1")
 	if path == "/manifest" || path == "/manifest/merge" { // the automatic send (manifest_test.go tests it)
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{}`)
@@ -819,8 +833,9 @@ func (w *wrapped) outputSchemas(t *testing.T) map[string]map[string]any {
 	return schemas
 }
 
-// A result that carries a beacon already (a tool's own, or middleware
-// after Attach's) keeps it, last, and gets no second one.
+// A beacon line ending a result's own text (a message the tool relays,
+// say) is dropped, and Wakeshift's ends it; a result whose own _meta
+// carries a connector beacon gets no second one.
 func TestEventsSkipIfPresent(t *testing.T) {
 	w := newWrapped(t, appkit.AttachOptions{})
 	own := "(For Wakeshift's hook on this computer, not for you: wakeshift-beacon: dddddddddd.eeeeeeeeee.ffffffffff)"
@@ -834,10 +849,10 @@ func TestEventsSkipIfPresent(t *testing.T) {
 	}))
 	codex := map[string]any{"x-codex-turn-metadata": map[string]any{"thread_id": "t1"}}
 	res := w.callTool(t, "ada", "", "own_trailer", map[string]any{"table": "oak", "session_key": "x"}, codex)
-	if want := []string{"Mine.", "Wakeshift: this conversation is woken by Monitor.", own}; !eqStrings(res.texts(), want) {
+	if want := []string{"Mine.", "Wakeshift: this conversation is woken by Monitor.", testTrailer}; !eqStrings(res.texts(), want) {
 		t.Fatalf("own trailer: %q", res.texts())
 	}
-	if _, has := res.Meta[appkit.ConnectorMetaKey]; has || res.Meta["other"] != "x" {
+	if res.Meta[appkit.ConnectorMetaKey] != "tok" || res.Meta["other"] != "x" {
 		t.Fatalf("own trailer's meta: %v", res.Meta)
 	}
 	res = w.callTool(t, "ada", "", "own_meta", map[string]any{"table": "elm", "session_key": "x"}, codex)
@@ -1242,5 +1257,57 @@ func TestClientChecksGolden(t *testing.T) {
 				t.Errorf("%s: Wakeshift was asked: %s", c.Name, p)
 			}
 		}
+	}
+}
+
+// A result that asks the client for input (go-sdk's multi-round trip, on
+// protocol 2026-07-28) isn't final: the client calls again with the
+// answers. What the round subscribed is rolled back, and it gets no block
+// (go-sdk refuses content beside inputRequests).
+func TestEventsInputRequiredIsNotFinal(t *testing.T) {
+	w := newWrapped(t, appkit.AttachOptions{})
+	mcp.AddTool(w.srv, &mcp.Tool{Name: "confirm_join"}, appkit.Events(w.at,
+		func(ctx context.Context, call *appkit.ToolCall, in tableIn) (*mcp.CallToolResult, any, error) {
+			if _, err := w.shared.Subscribe(ctx, call, tableArgs{Table: in.Table}); err != nil {
+				return nil, nil, err
+			}
+			return &mcp.CallToolResult{InputRequests: mcp.InputRequestMap{
+				"confirm": &mcp.ElicitParams{Message: "Join " + in.Table + "?", RequestedSchema: map[string]any{"type": "object", "properties": map[string]any{}}},
+			}}, nil, nil
+		}, appkit.Subscribes(w.shared)))
+	b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{"name": "confirm_join", "arguments": map[string]any{"table": "oak", "session_key": "wsc_s1"}, "_meta": map[string]any{
+			"io.modelcontextprotocol/protocolVersion":    "2026-07-28",
+			"io.modelcontextprotocol/clientInfo":         map[string]any{"name": "claude-code", "version": "2.1.280"},
+			"io.modelcontextprotocol/clientCapabilities": map[string]any{"elicitation": map[string]any{}},
+		}}})
+	req, _ := http.NewRequest("POST", w.url, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer ada")
+	req.Header.Set("Mcp-Protocol-Version", "2026-07-28")
+	req.Header.Set("Mcp-Method", "tools/call")
+	req.Header.Set("Mcp-Name", "confirm_join")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var out struct {
+		Result map[string]any `json:"result"`
+	}
+	json.Unmarshal(raw, &out)
+	if out.Result["inputRequests"] == nil {
+		t.Fatalf("no inputRequests: %s", raw)
+	}
+	if content, _ := out.Result["content"].([]any); len(content) > 0 {
+		t.Fatalf("an input_required result got Wakeshift's block: %s", raw)
+	}
+	if got := strings.Join(w.core.paths(), ","); got != "/event-subscriptions,/event-subscriptions/unsubscribe" {
+		t.Fatalf("core calls: %s, want the round's subscription rolled back and no block", got)
+	}
+	if un := w.core.bodies("/event-subscriptions/unsubscribe"); un[0]["reason"] != "rolled_back" {
+		t.Fatalf("unsubscribe: %v", un[0])
 	}
 }

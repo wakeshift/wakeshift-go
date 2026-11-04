@@ -232,6 +232,9 @@ func (at *Attachment) run(ctx context.Context, req mcp.CallToolRequest, args app
 		if blk.Text != "" && !setWakeshift(res, blk.Text) {
 			side.WarnStructured(call)
 		}
+	default:
+		// Nothing to add, but a beacon line ending the tool's text is still dropped.
+		dropTrailers(res)
 	}
 	return res, nil
 }
@@ -365,26 +368,24 @@ func schemaOf(raw json.RawMessage, typed any) map[string]any {
 }
 
 // mergeBlock adds Wakeshift's block to res after the tool's content: its
-// text, then a text-carried beacon as the last line, and _meta. A result
-// that already carries a beacon keeps it, last, and gets no second one.
+// text, then a text-carried beacon as the last line, and _meta. Beacon
+// lines ending the tool's own text are dropped (dropTrailers). A result
+// whose own _meta carries a connector beacon gets no second one, in _meta
+// or its text.
 func mergeBlock(res *mcp.CallToolResult, blk adapt.Block) {
 	metaBeacon := false
 	if res.Meta != nil {
 		_, metaBeacon = res.Meta.AdditionalFields[appkit.ConnectorMetaKey]
 	}
-	existing := takeTrailer(res)
+	dropTrailers(res)
 	if blk.Text != "" {
 		res.Content = append(res.Content, mcp.NewTextContent(blk.Text))
 	}
-	has := metaBeacon || existing != ""
-	switch {
-	case existing != "":
-		res.Content = append(res.Content, mcp.NewTextContent(existing))
-	case !has && blk.Trailer != "":
+	if !metaBeacon && blk.Trailer != "" {
 		res.Content = append(res.Content, mcp.NewTextContent(blk.Trailer))
 	}
 	for k, v := range blk.Meta {
-		if k == appkit.ConnectorMetaKey && has {
+		if k == appkit.ConnectorMetaKey && metaBeacon {
 			continue
 		}
 		if res.Meta == nil {
@@ -397,38 +398,44 @@ func mergeBlock(res *mcp.CallToolResult, blk adapt.Block) {
 	}
 }
 
-// takeTrailer takes a beacon line off the end of res's text (dropping its
-// block if nothing else is in it), returning it ("" if there's none).
-func takeTrailer(res *mcp.CallToolResult) string {
-	if len(res.Content) == 0 {
-		return ""
+// dropTrailers takes every beacon line off the end of res's last text
+// (dropping its block if nothing else is in it). Only Wakeshift's own
+// trailer may end a wrapped tool's text: a hook acts on the beacon there,
+// and one in the tool's text may be someone else's, relayed (a chat
+// message carrying a beacon minted for another session).
+func dropTrailers(res *mcp.CallToolResult) {
+	for {
+		i := len(res.Content) - 1
+		var text string
+		for ; i >= 0; i-- {
+			if c, ok := res.Content[i].(mcp.TextContent); ok {
+				text = c.Text
+				break
+			}
+			if c, ok := res.Content[i].(*mcp.TextContent); ok {
+				text = c.Text
+				break
+			}
+		}
+		if i < 0 {
+			return
+		}
+		rest, line := adapt.SplitTrailer(text)
+		if line == "" {
+			return
+		}
+		if rest == "" {
+			res.Content = append(res.Content[:i:i], res.Content[i+1:]...)
+			continue
+		}
+		switch c := res.Content[i].(type) {
+		case mcp.TextContent:
+			c.Text = rest
+			res.Content[i] = c
+		case *mcp.TextContent:
+			c.Text = rest
+		}
 	}
-	last := len(res.Content) - 1
-	var text string
-	switch c := res.Content[last].(type) {
-	case mcp.TextContent:
-		text = c.Text
-	case *mcp.TextContent:
-		text = c.Text
-	default:
-		return ""
-	}
-	rest, line := adapt.SplitTrailer(text)
-	if line == "" {
-		return ""
-	}
-	if rest == "" {
-		res.Content = res.Content[:last]
-		return line
-	}
-	switch c := res.Content[last].(type) {
-	case mcp.TextContent:
-		c.Text = rest
-		res.Content[last] = c
-	case *mcp.TextContent:
-		c.Text = rest
-	}
-	return line
 }
 
 // dropUndeclared removes from a call's arguments every property its tool's

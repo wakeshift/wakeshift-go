@@ -60,7 +60,10 @@ func (at *Attachment) middleware(next mcp.MethodHandler) mcp.MethodHandler {
 			return res, err
 		}
 		out, _ := res.(*mcp.CallToolResult)
-		failed := err != nil || out == nil || out.IsError || ctx.Err() != nil
+		// A result that asks the client for input (go-sdk's multi-round
+		// trip) isn't final: the client calls again with the answers, and
+		// the handler subscribes again then (as mcpgo's adapter does).
+		failed := err != nil || out == nil || out.IsError || ctx.Err() != nil || out.NeedsInput() || len(out.InputRequests) > 0
 		blk, has, failure := at.finish(ctx, s, failed)
 		switch {
 		case failed:
@@ -69,6 +72,9 @@ func (at *Attachment) middleware(next mcp.MethodHandler) mcp.MethodHandler {
 			return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: failure}}}, nil
 		case has:
 			at.applyBlock(s, out, blk)
+		default:
+			// Nothing to add, but a beacon line ending the app's text is still dropped.
+			dropTrailers(out)
 		}
 		return res, err
 	}
@@ -245,24 +251,21 @@ func withWakeshiftField(schema map[string]any) (map[string]any, bool) {
 }
 
 // mergeBlock adds Wakeshift's text to res as a block after the app's
-// content, then a text-carried beacon as the last line, and _meta. A result
-// that already carries a beacon (a tool or older middleware added one)
-// keeps it, last, and gets no second one.
+// content, then a text-carried beacon as the last line, and _meta. Beacon
+// lines ending the app's own text are dropped (dropTrailers). A result
+// whose own _meta carries a connector beacon gets no second one, in _meta
+// or its text.
 func mergeBlock(res *mcp.CallToolResult, text, trailer string, meta map[string]any) {
 	_, metaBeacon := res.Meta[ConnectorMetaKey]
-	existing := takeTrailer(res)
+	dropTrailers(res)
 	if text != "" {
 		res.Content = append(res.Content, &mcp.TextContent{Text: text})
 	}
-	has := metaBeacon || existing != ""
-	switch {
-	case existing != "":
-		res.Content = append(res.Content, &mcp.TextContent{Text: existing})
-	case !has && trailer != "":
+	if !metaBeacon && trailer != "" {
 		res.Content = append(res.Content, &mcp.TextContent{Text: trailer})
 	}
 	for k, v := range meta {
-		if k == ConnectorMetaKey && has {
+		if k == ConnectorMetaKey && metaBeacon {
 			continue
 		}
 		if res.Meta == nil {
@@ -272,26 +275,34 @@ func mergeBlock(res *mcp.CallToolResult, text, trailer string, meta map[string]a
 	}
 }
 
-// takeTrailer takes a beacon line off the end of res's text (dropping its
-// block if nothing else is in it), returning it ("" if there's none).
-func takeTrailer(res *mcp.CallToolResult) string {
-	if len(res.Content) == 0 {
-		return ""
+// dropTrailers takes every beacon line off the end of res's last text
+// (dropping its block if nothing else is in it). Only Wakeshift's own
+// trailer may end a wrapped tool's text: a hook acts on the beacon there,
+// and one in the app's text may be someone else's, relayed (a chat message
+// carrying a beacon minted for another session).
+func dropTrailers(res *mcp.CallToolResult) {
+	for {
+		i := len(res.Content) - 1
+		for i >= 0 {
+			if _, ok := res.Content[i].(*mcp.TextContent); ok {
+				break
+			}
+			i--
+		}
+		if i < 0 {
+			return
+		}
+		tc := res.Content[i].(*mcp.TextContent)
+		rest, line := adapt.SplitTrailer(tc.Text)
+		if line == "" {
+			return
+		}
+		if rest == "" {
+			res.Content = append(res.Content[:i:i], res.Content[i+1:]...)
+		} else {
+			tc.Text = rest
+		}
 	}
-	tc, ok := res.Content[len(res.Content)-1].(*mcp.TextContent)
-	if !ok {
-		return ""
-	}
-	rest, line := adapt.SplitTrailer(tc.Text)
-	if line == "" {
-		return ""
-	}
-	if rest == "" {
-		res.Content = res.Content[:len(res.Content)-1]
-	} else {
-		tc.Text = rest
-	}
-	return line
 }
 
 // setWakeshift sets a structured result's wakeshift field to the block's

@@ -114,9 +114,14 @@ type mergeBody struct {
 // types, merged into what Wakeshift has. A process that only emits sends
 // it only on an unknown_event (resendManifest): the event types it defines
 // may be fewer, or older, than its server's.
+//
+// Calls that wait for one send share its outcome: if it fails, they fail
+// with its error rather than each sending again, one after another (as
+// the TypeScript SDK's share one send). The next call sends again.
 func (a *App) ensureManifest(ctx context.Context) error {
 	a.mu.Lock()
 	done := !a.attached || a.sent && a.sentGen == a.gen
+	seen := a.ensures
 	a.mu.Unlock()
 	if done {
 		return nil
@@ -125,11 +130,23 @@ func (a *App) ensureManifest(ctx context.Context) error {
 	defer a.sendMu.Unlock()
 	a.mu.Lock()
 	done = a.sent && a.sentGen == a.gen
+	failed, ferr := a.ensures != seen, a.ensureErr
 	a.mu.Unlock()
-	if done {
+	switch {
+	case done:
 		return nil // sent while this one waited
+	case failed && ferr != nil:
+		return ferr // the send this one waited for failed
 	}
-	return a.mergeManifest(ctx)
+	err := a.mergeManifest(ctx)
+	// A send its own caller gave up on (canceled, or past its deadline)
+	// isn't shared: the calls waiting send with their own contexts.
+	if err != nil && ctx.Err() == nil {
+		a.mu.Lock()
+		a.ensures, a.ensureErr = a.ensures+1, err
+		a.mu.Unlock()
+	}
+	return err
 }
 
 // resendManifest is an emit's answer to unknown_event: Wakeshift doesn't

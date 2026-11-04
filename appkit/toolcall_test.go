@@ -895,7 +895,7 @@ func TestIdentityClient(t *testing.T) {
 }
 
 // AttachOptions.Tools picks which of Attach's own tools it adds: all three
-// by default, the ones it names, or none; an unknown name panics.
+// by default, each unless disabled.
 func TestAttachTools(t *testing.T) {
 	listed := func(w *wrapped) []string {
 		b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": map[string]any{}})
@@ -923,24 +923,23 @@ func TestAttachTools(t *testing.T) {
 		slices.Sort(names)
 		return names
 	}
+	// The zero value is the default; each of the three is on unless
+	// disabled, and the wait tool (not in a plain tools/list) changes none.
+	off := appkit.Tool{Disabled: true}
 	for _, c := range []struct {
-		tools []string
+		tools appkit.Tools
 		want  []string
 	}{
-		{nil, []string{"list_subscriptions", "subscribe_events", "unsubscribe_events"}},
-		{[]string{appkit.ListSubscriptionsTool, appkit.UnsubscribeEventsTool}, []string{"list_subscriptions", "unsubscribe_events"}},
-		{[]string{}, nil},
+		{appkit.Tools{}, []string{"list_subscriptions", "subscribe_events", "unsubscribe_events"}},
+		{appkit.Tools{Wait: appkit.Wait{Enabled: true}}, []string{"list_subscriptions", "subscribe_events", "unsubscribe_events"}},
+		{appkit.Tools{Subscribe: off}, []string{"list_subscriptions", "unsubscribe_events"}},
+		{appkit.Tools{Subscribe: off, Unsubscribe: off}, []string{"list_subscriptions"}},
+		{appkit.Tools{Subscribe: off, List: off, Unsubscribe: off}, nil},
 	} {
 		if got := listed(newWrapped(t, appkit.AttachOptions{Tools: c.tools})); !eqStrings(got, c.want) {
-			t.Fatalf("Tools %q: listed %q", c.tools, got)
+			t.Fatalf("Tools %+v: listed %q", c.tools, got)
 		}
 	}
-	defer func() {
-		if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), `"subscribe"`) {
-			t.Fatalf("an unknown tool: %v", r)
-		}
-	}()
-	newWrapped(t, appkit.AttachOptions{Tools: []string{"subscribe"}})
 }
 
 // unsubscribe_events adds what Wakeshift answers the unsubscribe with (that

@@ -2,6 +2,27 @@
 
 What changed in each release of `github.com/wakeshift/wakeshift-go`. v0.4.0 is the first published release: to start with it, read the [README](README.md). Its notes below, and the earlier releases', are for apps that ran the preview builds.
 
+## v0.9.0 (2026-11-03)
+
+### Changed
+
+- **`wakeshift_wait` is opt-in.** `Attach` (and `mcpgo.Attach`) no longer has `Wrap` serve Claude Code's wait tool unless you turn it on: `AttachOptions{Tools: appkit.Tools{Wait: appkit.Wait{Enabled: true}}}`. While a conversation waits on it, Claude Code keeps a request open to your server for about 20 seconds at a time and sends the next about a second later, for as long as it waits, whether or not anything arrives: on a serverless host, a function invocation per waiting conversation, all the time. This changes behavior for apps on today's defaults: a recent Claude Code in the terminal whose user declines Wakeshift's plugin now waits with a background monitor, as every other Claude Code does, rather than on your server. In manual permission mode that means approving the monitor, and each restart every 25 minutes, instead of one approval of `wakeshift_wait`; and the wait no longer carries on through `claude --continue`. Users who install the plugin see no difference. To keep the wait tool, set `Tools.Wait.Enabled`, and give the endpoint a write timeout of at least 30 seconds. Without it, `server/discover` no longer offers the tasks extension, tools/list no longer lists `wakeshift_wait`, and Wakeshift's `tasks/get` and `tasks/cancel` go on to your handler.
+
+### Breaking
+
+- **`AttachOptions.Tools` is now an `appkit.Tools` struct, not a list of names** (and `mcpgo.AttachOptions.Tools` the same). Its zero value is the default, so the tools on by default have a `Disabled` field (`Subscribe`, `List`, `Unsubscribe`: `appkit.Tool{Disabled: true}`) and the wait tool, off by default, an `Enabled` one (`Wait: appkit.Wait{Enabled: true}`). The list form is gone. Before and after:
+
+  ```go
+  // before
+  appkit.AttachOptions{Tools: []string{appkit.UnsubscribeEventsTool, appkit.ListSubscriptionsTool}}
+  appkit.AttachOptions{Tools: []string{}}
+  // after
+  appkit.AttachOptions{Tools: appkit.Tools{Subscribe: appkit.Tool{Disabled: true}}}
+  appkit.AttachOptions{Tools: appkit.Tools{Subscribe: appkit.Tool{Disabled: true}, List: appkit.Tool{Disabled: true}, Unsubscribe: appkit.Tool{Disabled: true}}}
+  ```
+
+  An app that set no `Tools` needs no change. The tool name constants (`SubscribeEventsTool` and the others) stay.
+
 ## v0.8.0 (2026-11-03)
 
 ### Added

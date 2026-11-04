@@ -20,11 +20,12 @@ func init() { adapt.Impl = bridge{} }
 type bridge struct{}
 
 // Attach is Attach without go-sdk: the Attachment (whose Wrap serves MCP
-// Events and the wait tool, whatever library serves the rest), and Attach's
-// own tools that tools names, for the adapter to add to its server.
-func (bridge) Attach(a *App, identify func(context.Context, *auth.TokenInfo) Identity, native func(context.Context, adapt.Request) bool, tools []string) (*Attachment, []adapt.Tool) {
-	at := a.attach(identify, native)
-	return at, a.eventTools(at, builtinTools(tools))
+// Events and, with tools.Wait, the wait tool, whatever library serves the
+// rest), and Attach's own tools that tools picks, for the adapter to add to
+// its server.
+func (bridge) Attach(a *App, identify func(context.Context, *auth.TokenInfo) Identity, native func(context.Context, adapt.Request) bool, tools Tools) (*Attachment, []adapt.Tool) {
+	at := a.attach(identify, native, tools.Wait.Enabled)
+	return at, a.eventTools(at, tools.builtin())
 }
 
 // ArgsOf is a wrapped tool's input's WakeArgs.

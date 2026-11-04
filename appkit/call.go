@@ -46,7 +46,8 @@ type wireCall struct {
 	// result.
 	Tool string `json:"tool,omitempty"`
 	// Tasks: the client takes MCP tasks (protocol 2026-07-28 with the tasks
-	// extension), and Wrap serves the wait tool for it (tasks.go).
+	// extension), and Wrap serves the wait tool for it (Tools.Wait,
+	// tasks.go): never set without Wait.
 	Tasks bool `json:"tasks,omitempty"`
 }
 
@@ -88,6 +89,12 @@ func wireOf(r adapt.Request, user, session string) wireCall {
 		c.UserAgent = r.Header.Get("User-Agent")
 	}
 	c.Tasks = takesTasks(c.Meta, r.Header)
+	return c
+}
+
+// tasksIf is the call with Tasks only if Wrap serves the wait tool (wait).
+func (c wireCall) tasksIf(wait bool) wireCall {
+	c.Tasks = c.Tasks && wait
 	return c
 }
 

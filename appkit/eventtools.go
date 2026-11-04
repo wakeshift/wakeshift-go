@@ -19,25 +19,52 @@ import (
 	"github.com/wakeshift/wakeshift-go/appkit/internal/adapt"
 )
 
-// The names of Attach's own tools, for AttachOptions.Tools.
+// The names of Attach's own tools.
 const (
 	SubscribeEventsTool   = "subscribe_events"
 	UnsubscribeEventsTool = "unsubscribe_events"
 	ListSubscriptionsTool = "list_subscriptions"
 )
 
-// builtinTools is which of Attach's own tools to add: tools' names, or all
-// three for nil. An unknown name is a mistake in the app, so it panics at
-// startup.
-func builtinTools(tools []string) map[string]bool {
-	out := map[string]bool{SubscribeEventsTool: tools == nil, UnsubscribeEventsTool: tools == nil, ListSubscriptionsTool: tools == nil}
-	for _, t := range tools {
-		if _, ok := out[t]; !ok {
-			panic("appkit: AttachOptions.Tools names " + strconv.Quote(t) + ": Attach's own tools are subscribe_events, unsubscribe_events and list_subscriptions")
-		}
-		out[t] = true
-	}
-	return out
+// Tools picks which of Attach's own tools it adds (AttachOptions.Tools).
+// Its zero value is the default: subscribe_events, unsubscribe_events and
+// list_subscriptions on, and the wait tool off. So the three that are on by
+// default have a Disabled field, and the wait tool, off by default, an
+// Enabled one: leaving a field out always means the default.
+type Tools struct {
+	// Wait is Wakeshift's wait tool, wakeshift_wait: off unless enabled.
+	Wait Wait
+	// Subscribe is subscribe_events, for clients that don't speak MCP
+	// Events (tools/list hides it from those that do).
+	Subscribe Tool
+	// List is list_subscriptions. Disable it, or Unsubscribe, only if your
+	// own tools let a person see and stop their subscriptions.
+	List Tool
+	// Unsubscribe is unsubscribe_events.
+	Unsubscribe Tool
+}
+
+// Tool is one of Attach's own tools that it adds unless disabled.
+type Tool struct {
+	Disabled bool
+}
+
+// Wait is the wait tool's options (Tools.Wait): Wakeshift's wait tool,
+// wakeshift_wait, Claude Code's wake path with nothing installed, where its
+// client takes MCP tasks (protocol 2026-07-28; tasks.go). Off by default:
+// Wrap serves no wait tool, and Claude Code is woken by its plugin or,
+// after a no, a background Monitor, as every other server's is. Enabled, a
+// waiting conversation's Claude Code holds a request to the endpoint
+// (tasks/get, about 20 seconds) and sends the next about a second later,
+// for as long as it waits: give the endpoint a write timeout of at least
+// 30 seconds.
+type Wait struct {
+	Enabled bool
+}
+
+// builtin is which of Attach's own tools besides the wait tool to add.
+func (t Tools) builtin() map[string]bool {
+	return map[string]bool{SubscribeEventsTool: !t.Subscribe.Disabled, UnsubscribeEventsTool: !t.Unsubscribe.Disabled, ListSubscriptionsTool: !t.List.Disabled}
 }
 
 // maxListedEvents is how many event types subscribe_events' description
@@ -211,7 +238,7 @@ func (a *App) eventTools(at *Attachment, tools map[string]bool) []adapt.Tool {
 	// callOf is the tool call as Wakeshift takes it (with the app's agent,
 	// if Identify gives one; "" for the user if there's none).
 	callOf := func(ctx context.Context, req adapt.Request, args WakeArgs) wireCall {
-		return who(ctx, req).apply(wireOf(req, "", args.SessionKey).withArgs(args))
+		return who(ctx, req).apply(wireOf(req, "", args.SessionKey).withArgs(args).tasksIf(at.wait))
 	}
 	argsProp := map[string]any{"type": "object", "description": eventTools["arguments_argument"]}
 	if len(types) > 0 {

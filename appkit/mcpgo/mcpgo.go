@@ -47,7 +47,7 @@ import (
 // adapters.go): the scope, rollback and block appkit.Events gives a
 // go-sdk tool, for an mcp-go one.
 type appkitSide interface {
-	Attach(a *appkit.App, identify func(context.Context, *auth.TokenInfo) appkit.Identity, native func(context.Context, adapt.Request) bool, tools []string) (*appkit.Attachment, []adapt.Tool)
+	Attach(a *appkit.App, identify func(context.Context, *auth.TokenInfo) appkit.Identity, native func(context.Context, adapt.Request) bool, tools appkit.Tools) (*appkit.Attachment, []adapt.Tool)
 	ArgsOf(in appkit.WakeInput) appkit.WakeArgs
 	WakeArgsProperties() map[string]any
 	Begin(ctx context.Context, at *appkit.Attachment, r adapt.Request, args appkit.WakeArgs) (context.Context, *appkit.ToolCall)
@@ -79,11 +79,10 @@ type AttachOptions struct {
 	// HTTP middleware in front of Wrap, so Wrap's requests carry it too. An
 	// error counts as no user. Nil: no request has a user.
 	Identify func(ctx context.Context, ti *auth.TokenInfo) (appkit.Identity, error)
-	// Tools names which of Attach's own tools it adds:
-	// appkit.SubscribeEventsTool, UnsubscribeEventsTool and
-	// ListSubscriptionsTool. Nil adds all three; an empty list adds none.
-	// Attach panics on a name that isn't one of them.
-	Tools []string
+	// Tools picks which of Attach's own tools it adds, as appkit's
+	// AttachOptions.Tools does: the zero value adds subscribe_events,
+	// unsubscribe_events and list_subscriptions, and not the wait tool.
+	Tools appkit.Tools
 	// Events configures the event features.
 	Events EventsOptions
 }

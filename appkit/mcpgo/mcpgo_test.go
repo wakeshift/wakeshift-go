@@ -313,7 +313,7 @@ func TestEventsAddsTheBlock(t *testing.T) {
 // core then gives the wait tool's instructions), and its tools/list has
 // Wakeshift's wait tool.
 func TestTasksClient(t *testing.T) {
-	a := newTestApp(t, mcpgo.AttachOptions{})
+	a := newTestApp(t, mcpgo.AttachOptions{Tools: appkit.Tools{Wait: appkit.Wait{Enabled: true}}})
 	a.srv.AddTools(mcpgo.Events(a.at, mcp.NewTool("join"),
 		func(ctx context.Context, call *appkit.ToolCall, _ mcp.CallToolRequest, in tableIn) (*mcp.CallToolResult, error) {
 			_, err := a.turn.Subscribe(ctx, call, tableArgs{Table: in.Table})
@@ -334,6 +334,33 @@ func TestTasksClient(t *testing.T) {
 	}
 	if call := a.core.bodies("/event-subscriptions")[0]["call"].(map[string]any); call["tasks"] != true {
 		t.Fatalf("the call: %v", call)
+	}
+}
+
+// Without Wait (the default), a client that takes tasks gets no wait tool,
+// and its calls don't say it takes tasks, so Wakeshift gives it its usual
+// wake path.
+func TestTasksClientWithoutWait(t *testing.T) {
+	a := newTestApp(t, mcpgo.AttachOptions{})
+	a.srv.AddTools(mcpgo.Events(a.at, mcp.NewTool("join"),
+		func(ctx context.Context, call *appkit.ToolCall, _ mcp.CallToolRequest, in tableIn) (*mcp.CallToolResult, error) {
+			_, err := a.turn.Subscribe(ctx, call, tableArgs{Table: in.Table})
+			return nil, err
+		}))
+	c := claudeCode
+	c.tasks = true
+	if _, ok := a.tools(t, c)[appkit.WaitTool]; ok {
+		t.Fatalf("%s without Wait", appkit.WaitTool)
+	}
+	a.call(t, c, "join", map[string]any{"table": "oak"})
+	if call := a.core.bodies("/event-subscriptions")[0]["call"].(map[string]any); call["tasks"] != nil {
+		t.Fatalf("the call: %v", call)
+	}
+	if _, rpcErr := a.rpc(t, c, "tasks/get", map[string]any{"taskId": appkit.TaskIDPrefix + "x"}); rpcErr == nil {
+		t.Fatal("tasks/get for a Wakeshift ID was answered without Wait")
+	}
+	if n := len(a.core.bodies("/calls/task/get")); n != 0 {
+		t.Fatalf("asked Wakeshift %d times", n)
 	}
 }
 
@@ -455,6 +482,12 @@ func TestNativeCaller(t *testing.T) {
 // capabilities added. events/list is answered by Wrap; subscribe_events
 // works without a wrapped tool; an anonymous caller gets no user.
 func TestDiscoverAndBuiltinTools(t *testing.T) {
+	// The tasks extension only with Wait (off by default).
+	if res, rpcErr := newTestApp(t, mcpgo.AttachOptions{Tools: appkit.Tools{Wait: appkit.Wait{Enabled: true}}}).rpc(t, claudeCode, "server/discover", nil); rpcErr != nil {
+		t.Fatalf("discover: %v", rpcErr)
+	} else if ext, _ := res["capabilities"].(map[string]any)["extensions"].(map[string]any); ext[appkit.TasksExtension] == nil {
+		t.Fatalf("with Wait, capabilities: %v", res["capabilities"])
+	}
 	a := newTestApp(t, mcpgo.AttachOptions{})
 	res, rpcErr := a.rpc(t, claudeCode, "server/discover", nil)
 	if rpcErr != nil {
@@ -462,7 +495,7 @@ func TestDiscoverAndBuiltinTools(t *testing.T) {
 	}
 	caps := res["capabilities"].(map[string]any)
 	ext, _ := caps["extensions"].(map[string]any)
-	if ext["io.modelcontextprotocol/events"] == nil || ext[appkit.TasksExtension] == nil || caps["tools"] == nil {
+	if ext["io.modelcontextprotocol/events"] == nil || ext[appkit.TasksExtension] != nil || caps["tools"] == nil {
 		t.Fatalf("capabilities: %v", caps)
 	}
 	if res["resultType"] != "complete" || res["ttlMs"] == nil || res["cacheScope"] == nil || res["supportedVersions"] == nil {

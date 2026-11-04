@@ -354,7 +354,7 @@ func (s *callScope) leave() {
 // conversation's session, and who's calling (the user, or the agent's
 // token).
 func (c *ToolCall) wire() wireCall {
-	call := wireOf(c.s.req, "", c.Session).withArgs(c.s.args)
+	call := wireOf(c.s.req, "", c.Session).withArgs(c.s.args).tasksIf(c.s.at.wait)
 	return c.s.identity.apply(call)
 }
 

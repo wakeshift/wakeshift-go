@@ -291,6 +291,10 @@ type Emitted struct {
 	// aren't that user's, or this event's): forget them. A duplicate
 	// reports the first emit's.
 	Ended []Recipient `json:"-"`
+	// TextTrimmed: the text was over 1000 bytes, so Wakeshift trimmed it to
+	// 1000 (ending with "…") and sent the occurrence. The SDK logs a
+	// warning once per event.
+	TextTrimmed bool `json:"text_trimmed,omitempty"`
 }
 
 // emitOptionsOf applies opts, trimming the whitespace around each
@@ -500,7 +504,16 @@ func (e *DefinedEvent[A, P]) Emit(ctx context.Context, args A, payload P, opts .
 	}
 	res := out.Emitted
 	res.Unmatched, res.Ended = recipientsOf(out.Unmatched), recipientsOf(out.Ended)
+	if err == nil && res.TextTrimmed {
+		e.app.warnOnce("text-trimmed:"+e.t.name, textTrimmedWarning(e.t.name), "event", e.t.name)
+	}
 	return res, err
+}
+
+// textTrimmedWarning is the warning when Wakeshift trimmed an event's text
+// (once per event).
+func textTrimmedWarning(event string) string {
+	return "appkit: " + event + "'s text was over 1000 bytes, so Wakeshift trimmed it: keep Text to a short headline and put the details in the payload"
 }
 
 // PublishURL makes a publish URL for this event with args (a personal

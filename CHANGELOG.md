@@ -2,6 +2,12 @@
 
 What changed in each release of `github.com/wakeshift/wakeshift-go`. v0.4.0 is the first published release: to start with it, read the [README](README.md). Its notes below, and the earlier releases', are for apps that ran the preview builds.
 
+## v0.9.3 (2026-11-05)
+
+### Changed
+
+- **Text over 1000 bytes is trimmed by Wakeshift rather than refused; no need to trim it yourself.** Wakeshift cuts it between characters to 1000 bytes, ending with "…", and sends the occurrence. `Emit` returns `Emitted.TextTrimmed` set when it happens, and logs a warning once per event. An emit's `id` still compares the text you sent, so a retry with the same long text is a duplicate.
+
 ## v0.9.2 (2026-11-04)
 
 ### Added

@@ -298,7 +298,7 @@ func TestEmitRecipientsGolden(t *testing.T) {
 		}
 		res := out.Emitted
 		res.Unmatched, res.Ended = recipientsOf(out.Unmatched), recipientsOf(out.Ended)
-		got := map[string]any{"matched": res.Matched, "duplicate": res.Duplicate, "unmatched": []any{}, "ended": []any{}}
+		got := map[string]any{"matched": res.Matched, "duplicate": res.Duplicate, "unmatched": []any{}, "ended": []any{}, "text_trimmed": res.TextTrimmed}
 		for _, r := range res.Unmatched {
 			got["unmatched"] = append(got["unmatched"].([]any), recipientJSON(r))
 		}

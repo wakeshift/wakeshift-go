@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -82,6 +83,15 @@ type App struct {
 	name       string
 	nameKnown  bool
 	nameFailed time.Time
+
+	warned sync.Map // warnOnce's keys
+}
+
+// warnOnce logs msg the first time key is seen.
+func (a *App) warnOnce(key, msg string, attrs ...any) {
+	if _, seen := a.warned.LoadOrStore(key, true); !seen {
+		slog.Warn(msg, attrs...)
+	}
 }
 
 // APIError is an error response from Wakeshift, or a mistake the SDK

@@ -2,7 +2,7 @@
 
 What changed in each release of `github.com/wakeshift/wakeshift-go`. v0.4.0 is the first published release: to start with it, read the [README](README.md). Its notes below, and the earlier releases', are for apps that ran the preview builds.
 
-## v0.10.0 (unreleased)
+## v0.10.0 (2026-11-06)
 
 One release across the three SDKs (TypeScript 0.11.0, Python 0.10.0, Go v0.10.0), with the same concepts, names and defaults in each. It breaks the Go API where that makes it simpler; nothing changes for an app until it upgrades.
 

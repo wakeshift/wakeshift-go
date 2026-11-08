@@ -486,8 +486,9 @@ func (c *ToolCall) wire() wireCall {
 // subscribing it to anything (it doesn't make the conversation wakeable),
 // and returns it. It returns "", with no request to Wakeshift, when nothing
 // names the conversation: no session_key, no conversation_id and no
-// conversation in the call's _meta (a Codex thread). On a disabled client
-// it returns CodeDisabled.
+// conversation in the call's _meta (a Codex thread). Without a user
+// (identify's), only the session_key names it: a conversation ID alone
+// returns "" too. On a disabled client it returns CodeDisabled.
 func (c *ToolCall) ResolveSession(ctx context.Context) (SessionKey, error) {
 	if c == nil {
 		return "", usage(CodeNoCall, "ResolveSession was called outside a tool call (a nil call)")
@@ -511,8 +512,12 @@ func (c *ToolCall) ResolveSession(ctx context.Context) (SessionKey, error) {
 		return c.Session(), nil
 	}
 	wire := c.wire()
-	if wire.Session == "" && wire.Conversation == "" && !namesConversation(wire.Meta) {
-		// Nothing names the conversation: Wakeshift would only start a new one.
+	named := wire.Conversation != "" || namesConversation(wire.Meta)
+	if wire.Session == "" && !(named && (wire.User != "" || wire.AgentToken != "")) {
+		// Without a session key, only a user's (or an agent token's) call
+		// finds its conversation by the ID its harness reports (a Codex
+		// thread): Wakeshift never finds a session by that ID alone, so for
+		// anything else it would only start a new one.
 		return "", nil
 	}
 	var out struct {

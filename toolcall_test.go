@@ -572,6 +572,71 @@ func TestResolveSessionNamesNothing(t *testing.T) {
 	}
 }
 
+// Without a user, only the session_key finds the conversation: a
+// harness's conversation ID alone (Channel3's unwatch_product, a tool that
+// subscribes to nothing, called by Codex with only its thread in _meta)
+// returns "", with no request.
+func TestResolveSessionWithoutUserNeedsTheKey(t *testing.T) {
+	w := newWrapped(t, wakeshift.AttachOptions{Identify: func(context.Context, wakeshift.Request) (wakeshift.Identity, error) { return wakeshift.Identity{}, nil }})
+	var got []string
+	wakeshift.AddTool(w.at, &mcp.Tool{Name: "unwatch"}, func(ctx context.Context, call *wakeshift.ToolCall, in tableIn) (*mcp.CallToolResult, any, error) {
+		if _, err := w.shared.Unsubscribe(ctx, call, tableArgs{Table: in.Table}); err != nil {
+			return nil, nil, err
+		}
+		s, err := call.ResolveSession(ctx)
+		got = append(got, string(s))
+		return nil, nil, err
+	})
+	raw, err := os.ReadFile(sharedGolden("conversation-meta.json"))
+	if err != nil {
+		t.Skip("no shared golden files here")
+	}
+	var f struct{ Keys []string }
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	nested := func(k string) map[string]any {
+		parts := strings.Split(k, ".")
+		var v any = "c1"
+		for i := len(parts) - 1; i > 0; i-- {
+			v = map[string]any{parts[i]: v}
+		}
+		return map[string]any{parts[0]: v}
+	}
+	type naming struct{ args, meta map[string]any }
+	cases := []naming{
+		{nil, nil},
+		{map[string]any{"conversation_id": "bc-1234"}, nil},
+		{nil, map[string]any{"threadId": "t0"}},
+	}
+	for _, k := range f.Keys {
+		cases = append(cases, naming{nil, nested(k)})
+	}
+	const codex = "codex-mcp-client/0.130.0"
+	call := func(c naming) (rpcResult, []string) {
+		w.core.reset()
+		got = nil
+		args := map[string]any{"table": "oak"}
+		for k, v := range c.args {
+			args[k] = v
+		}
+		return w.callTool(t, "anon", codex, "unwatch", args, c.meta), w.core.paths()
+	}
+	for _, c := range cases {
+		res, paths := call(c)
+		if res.IsError || !eqStrings(got, []string{""}) || slices.Contains(paths, "/calls/session") {
+			t.Fatalf("%v %v: %q %q %v", c.args, c.meta, res.texts(), got, paths)
+		}
+	}
+	// The session_key finds it, with the thread or without.
+	for _, meta := range []map[string]any{nil, nested("x-codex-turn-metadata.thread_id")} {
+		res, paths := call(naming{map[string]any{"session_key": "wsc_s1"}, meta})
+		if res.IsError || !eqStrings(got, []string{"wsc_resolved"}) || !slices.Contains(paths, "/calls/session") {
+			t.Fatalf("session_key, %v: %q %q %v", meta, res.texts(), got, paths)
+		}
+	}
+}
+
 // Rollback is decided from the final result: a handler error, an isError
 // result, a JSON-RPC error and an output that fails the output schema each
 // end the subscriptions the call created (and only those), with reason

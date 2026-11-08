@@ -114,6 +114,13 @@ type Harness struct {
 	// its names it sends, so a conversation keeps its agent (and its
 	// session key) across the harness's versions.
 	Shared []string
+	// ClientPrefix, if set, is a start of client names only it sends,
+	// compared case-insensitively, followed by names that vary (Claude
+	// Cowork's plugin servers: "local-agent-mode-plugin:<plugin>:<server>").
+	// ForClient takes such a name as one of its Clients that others don't
+	// send; its agents are named after the client's own name if it has
+	// Shared ones (NamedByClient).
+	ClientPrefix string
 	// Unsure, set with Shared, is the condition its notes start with ("If
 	// you're …:") when a call was recognized only by a Shared name: the
 	// agent learns whether the note is for it. A call from one of its own
@@ -433,6 +440,29 @@ var all = []Harness{
 		Verified: "2.1.280",
 	},
 	{
+		// Claude Cowork, the Claude desktop app's Cowork tab. Its connectors
+		// (remote MCP servers) are called from Anthropic's servers with
+		// clientInfo "claude-ai", which claude.ai's web chat (and the app's
+		// own chats) send too, so the name is Shared and its notes say what
+		// to do with a Monitor tool and what without one (Unsure); a local
+		// MCP server in a Cowork plugin sees
+		// "local-agent-mode-plugin:<plugin>:<server>" (ClientPrefix; the
+		// spike's probe, November 7, 2026). The model has named itself
+		// "claude-ai" and "Claude app (claude.ai)" in the harness argument
+		// (Aliases). Cowork runs Claude Code, with its Monitor tool, and
+		// Monitor output wakes an idle task (November 7, 2026: a 3-tick
+		// command woke it three times); plugin hooks don't run in a task,
+		// and its MCP client takes no tasks, so the Monitor is the only wake
+		// path. Its shell runs in a VM behind the workspace's network
+		// allowlist (Settings > Capabilities), which may block the core's
+		// host: the notes have the agent check first and tell the user.
+		ID: "claude-cowork", Name: "Claude Cowork", Aliases: []string{"cowork", "claude-ai", "claude-app"},
+		Clients: []string{"claude-ai"}, Shared: []string{"claude-ai"}, ClientPrefix: "local-agent-mode-plugin:",
+		Unsure: coworkMonitor,
+		Wake:   Monitor, Ack: "at least once, confirmed by the Monitor's next round",
+		When: "as soon as they arrive, even while the task is idle, while Cowork is open and its Monitor runs",
+	},
+	{
 		ID: "cursor", Name: "Cursor", Claim: "cursor", ClaimHint: "local CLI or IDE", Aliases: []string{"cursor-agent", "cursor-cli", "cursor-ide", "cursor-local"}, Clients: []string{"Cursor", "cursor-vscode"}, UserAgents: []string{"Cursor"},
 		Wake: StopHook, ZeroInstall: Background, Ack: "at least once, acknowledged when the stop hook hands the message over",
 		Binding: Unbound, Carrier: Text, StripsText: true, Installable: true, ConversationEnv: "CURSOR_CONVERSATION_ID",
@@ -740,6 +770,9 @@ func ForClient(name string) (Harness, bool) {
 			if strings.ToLower(c) == name {
 				return h, true
 			}
+		}
+		if p := strings.ToLower(h.ClientPrefix); p != "" && strings.HasPrefix(name, p) && len(name) > len(p) {
+			return h, true
 		}
 	}
 	return Harness{}, false
@@ -1269,6 +1302,10 @@ func installNote(h Harness, install string) string {
 	if h.ZeroInstall == Background && !h.Installable {
 		// Muse: the command is the only way, and there's nothing to install.
 		return "You can be woken now, within seconds even while idle, by a command you start in the background (subscribing gives it)."
+	}
+	if h.Wake == Monitor && !h.Installable {
+		// Claude Cowork: a Monitor the agent starts, and nothing to install.
+		return "You can be woken now, within seconds even while idle, by a Monitor you start (subscribing gives its command)."
 	}
 	if !h.Installable {
 		return CantWake(h.Name)

@@ -6,16 +6,27 @@ name: Release
 # checks the tag is the CHANGELOG's newest entry, asks the proxy for it so
 # it's fetchable at once, and makes a GitHub release with the CHANGELOG's
 # notes and a CycloneDX SBOM of the module's dependencies.
+#
+# workflow_dispatch runs it again for a tag that has no release yet (one
+# whose run failed), from the tag's own files; it never makes or moves a tag.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag (v0.10.1)
+        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -25,15 +36,20 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: The tag is a release's
+        run: |
+          if ! printf '%s\n' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'; then
+            echo "$TAG isn't a release tag (vMAJOR.MINOR.PATCH)" >&2
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ env.TAG }}
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: The tag is the CHANGELOG's newest entry
-        env:
-          TAG: ${{ github.ref_name }}
         run: |
           top=$(sed -n 's/^## \(v[^ ]*\) .*/\1/p' CHANGELOG.md | head -n 1)
           if [ "$TAG" != "$top" ]; then
@@ -47,15 +63,33 @@ jobs:
           ' CHANGELOG.md >release/notes.md
       - run: go vet ./...
       - run: go build ./...
+      # On the module's own Go (go.mod's go line; setup-go sets
+      # GOTOOLCHAIN=local), so the generator is pinned to a release whose go.mod
+      # that Go builds: v1.10.0 is the newest needing no more than go 1.25
+      # (v1.11.0 and later need 1.26). Raise it with the module's go line, and
+      # the checksum with it (sum.golang.org/lookup/<module>@<version>).
       - name: SBOM
         env:
-          TAG: ${{ github.ref_name }}
+          GENERATOR: github.com/CycloneDX/cyclonedx-gomod
+          GENERATOR_VERSION: v1.10.0
+          GENERATOR_SUM: h1:9Vy3zcC+lJLgcR4xYQvwPGU6L2Rij/Ld47lyucYjVI0=
+          GOPROXY: https://proxy.golang.org
+          GOSUMDB: sum.golang.org
+          GONOSUMDB: ""
+          GOPRIVATE: ""
+          GOFLAGS: ""
         run: |
-          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
-          "$(go env GOPATH)/bin/cyclonedx-gomod" mod -licenses -json -output "release/wakeshift-go-$TAG.cdx.json"
+          set -eu
+          out="$PWD/release/wakeshift-go-$TAG.cdx.json"
+          # Outside the module, so its go.mod and go.sum stay as tagged.
+          sum=$(cd "$RUNNER_TEMP" && go mod download -json "$GENERATOR@$GENERATOR_VERSION" | jq -r .Sum)
+          if [ "$sum" != "$GENERATOR_SUM" ]; then
+            echo "$GENERATOR@$GENERATOR_VERSION is $sum, not the pinned $GENERATOR_SUM" >&2
+            exit 1
+          fi
+          (cd "$RUNNER_TEMP" && go install "$GENERATOR/cmd/cyclonedx-gomod@$GENERATOR_VERSION")
+          "$(go env GOPATH)/bin/cyclonedx-gomod" mod -licenses -json -output "$out"
       - name: The proxy has it
-        env:
-          TAG: ${{ github.ref_name }}
         run: |
           for _ in 1 2 3 4 5; do
             if curl -fsS "https://proxy.golang.org/github.com/wakeshift/wakeshift-go/@v/$TAG.info"; then exit 0; fi
@@ -65,7 +99,6 @@ jobs:
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
         run: |
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "$TAG" --notes-file release/notes.md release/*.cdx.json

@@ -80,7 +80,9 @@ func Picker() []PickerAgent {
 				{Kind: "note", Text: "Then choose Connect."},
 			},
 			Wakes: []string{
-				"{Each} wakes the agent within seconds while Cowork is open, even when it's idle. Nothing to install.",
+				"The agent starts a background listener in the Cowork task. {Each} then wakes it within seconds while Cowork is open, even when it's idle. Nothing to install.",
+				"If the agent says it can't reach Wakeshift, allow app.wakeshift.ai in the Claude app under Settings > Capabilities (on Team and Enterprise plans, an owner does it under Organization settings > Capabilities), then tell the agent.",
+				"In a Claude chat outside Cowork, the agent isn't woken: it sees what's new the next time it uses the app's tools.",
 			},
 		},
 		{

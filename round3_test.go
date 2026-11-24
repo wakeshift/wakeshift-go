@@ -304,9 +304,10 @@ func TestCloseEndsACheckInFlight(t *testing.T) {
 	defer wakeshift.SetWatchHooks(time.Millisecond, nil)()
 	wake := testClient(t, "https://core.example")
 	ev, _ := wakeshift.DefineEvent(wake, "table.news", wakeshift.EventDef[tableArgs, turnMsg]{Description: "News", Public: true})
-	checking, returned := make(chan struct{}), make(chan error, 1)
+	checking, checked, returned := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	go func() {
 		returned <- ev.Watch(context.Background(), tableArgs{Table: "oak"}, func(ctx context.Context) (turnMsg, bool, error) {
+			defer close(checked)
 			close(checking)
 			<-ctx.Done()
 			return turnMsg{}, false, ctx.Err()
@@ -320,12 +321,20 @@ func TestCloseEndsACheckInFlight(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close didn't end the check")
 	}
+	// Close waits for the check. Watch's result reaches this test's
+	// goroutine only after Watch has told Close it's done, so Close may
+	// return first: wait for the result rather than expect it sent.
+	select {
+	case <-checked:
+	default:
+		t.Fatal("Close returned before the check")
+	}
 	select {
 	case err := <-returned:
 		if !errors.Is(err, context.Canceled) {
 			t.Errorf("watch: %v", err)
 		}
-	default:
-		t.Fatal("Close returned before the watch")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the watch didn't return after Close")
 	}
 }

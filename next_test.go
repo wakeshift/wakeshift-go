@@ -375,8 +375,7 @@ type tenantKey struct{}
 // the request that started the session, Identify still runs per POST with
 // that POST's own context and token (Handler makes the POST the unit of
 // identity): a second POST with a new token (the same user's: go-sdk binds
-// a session to its user) and a new middleware value gets both (design
-// §2.8, GO #1).
+// a session to its user) and a new middleware value gets both (GO #1).
 func TestStatefulSessionIdentityPerPOST(t *testing.T) {
 	core := newPathCore()
 	cs := httptest.NewServer(core)

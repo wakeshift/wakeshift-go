@@ -214,3 +214,37 @@ func TestFormatRoundTrips(t *testing.T) {
 		}
 	}
 }
+
+// ForServer: a new key that parses back to the seed, and a WAKESHIFT_APPS
+// list with the one app and that key's public half; name defaults to the
+// ID, and a malformed ID or seed is refused.
+func TestForServer(t *testing.T) {
+	seed := bytes.Repeat([]byte{7}, 32)
+	key, apps, err := appkey.ForServer("example", "", seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := appkey.Parse(key)
+	if err != nil || !bytes.Equal(k.Seed, seed) || k.AppID != "" {
+		t.Fatalf("the key doesn't parse back to a new key with its seed: %v", err)
+	}
+	var list []map[string]string
+	if err := json.Unmarshal([]byte(apps), &list); err != nil || len(list) != 1 {
+		t.Fatalf("WAKESHIFT_APPS %s: %v", apps, err)
+	}
+	pub, err := base64.StdEncoding.DecodeString(list[0]["public_key"])
+	if err != nil || appkey.KeyID(pub) != k.KeyID() || list[0]["id"] != "example" || list[0]["name"] != "example" {
+		t.Fatalf("WAKESHIFT_APPS %s isn't the key's app", apps)
+	}
+	if _, named, _ := appkey.ForServer("example", "Example App", seed); !strings.Contains(named, `"name":"Example App"`) {
+		t.Fatalf("a name: %s", named)
+	}
+	for _, bad := range []string{"Example", "1app", "a", "has space", strings.Repeat("a", 41)} {
+		if _, _, err := appkey.ForServer(bad, "", seed); err != appkey.ErrAppID {
+			t.Errorf("app ID %q: %v", bad, err)
+		}
+	}
+	if _, _, err := appkey.ForServer("example", "", seed[:31]); err == nil {
+		t.Error("a 31-byte seed was taken")
+	}
+}

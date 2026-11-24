@@ -1,6 +1,6 @@
 package wakeshift
 
-// One error hierarchy, the same in the three SDKs (design §2.10): an
+// One error hierarchy, the same in the three SDKs: an
 // *APIError when talking to Wakeshift failed (it refused, or didn't answer:
 // Status 0), and a *UsageError for a mistake caught before sending. Both
 // carry a Code from one list, which errors.json pins (codes), and IsCode
@@ -122,7 +122,15 @@ type APIError struct {
 	RequestID string
 
 	err error // the transport's error, for Status 0
+	// hint is what the core says the client can do instead (an
+	// unreachable MCP Events callback's hint), passed into the JSON-RPC
+	// error's data as it is (native.go). Behind a pointer, so APIError stays
+	// comparable, as it was before the hint.
+	hint *errorHint
 }
+
+// errorHint holds an APIError's hint (a map isn't comparable).
+type errorHint struct{ data map[string]any }
 
 func (e *APIError) Error() string {
 	if e.Status == 0 && (e.Code == CodeUnreachable || e.Code == CodeTimeout) {

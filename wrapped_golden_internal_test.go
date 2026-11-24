@@ -92,7 +92,7 @@ func TestWrappedBlockGolden(t *testing.T) {
 		}
 		// What addBlock does with /calls/addition's answer.
 		text := add.Text
-		mergeBlock(&res, text, add.Trailer, add.Meta)
+		mergeBlock(&res, adapt.Block{Text: text, Trailer: add.Trailer, Meta: add.Meta})
 		if text != "" && res.StructuredContent != nil {
 			setWakeshift(&res, text)
 		}

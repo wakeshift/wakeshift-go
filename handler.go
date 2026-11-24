@@ -1,8 +1,7 @@
 package wakeshift
 
 // Handler: Wakeshift at the HTTP layer, in front of the MCP library's own
-// handler (design §2.3, "Go: the HTTP layer is where the guarantees
-// hold"). It reads each POST once, moves Wakeshift's arguments out of every
+// handler: the HTTP layer is where the guarantees hold. It reads each POST once, moves Wakeshift's arguments out of every
 // tools/call's arguments before go-sdk or mcp-go parses the body (so no
 // middleware, validation or tool of yours sees them), answers events/* and
 // the wait tool, and makes the POST the unit of identity: Identify runs at
@@ -310,7 +309,8 @@ func (c *Client) serveMessage(next http.Handler, w http.ResponseWriter, r *http.
 		}
 		json.Unmarshal(m.Params, &p)
 		drop := ""
-		if nativeClient(r, m.Params) {
+		client, ua := requestClient(r, m.Params)
+		if nativeClient(r, m.Params, set.servesPushFor(r.Context(), client, ua, p.Meta)) {
 			drop = subscribeEventsTool
 		}
 		if wait := set.wait && takesTasks(p.Meta, r.Header); drop != "" || wait {
@@ -335,7 +335,10 @@ func (c *Client) serveMessage(next http.Handler, w http.ResponseWriter, r *http.
 			return
 		}
 	case "events/list", "events/subscribe", "events/unsubscribe", "events/poll", "events/stream":
-		if !set.eventsKept.Load() {
+		// With no event defined, nothing is advertised (withEventsCapability)
+		// and nothing answered: the handler says -32601, as SEP-3415 has a
+		// server that doesn't offer the extension.
+		if !set.eventsKept.Load() && len(set.app.events()) > 0 {
 			set.serveEvents(w, r, post, m)
 			return
 		}

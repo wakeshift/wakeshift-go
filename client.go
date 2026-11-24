@@ -71,6 +71,8 @@ type Client struct {
 	lg   *slog.Logger // WithLogger's, or nil for slog.Default() at log time
 
 	maxRetries int
+	calls      CallTimeouts     // WithCallTimeouts', defaults filled in
+	breaker    breaker          // in-call requests' (incall.go)
 	now        func() time.Time // the clock (tests set it)
 
 	mu         sync.Mutex
@@ -86,7 +88,7 @@ type Client struct {
 	idFailedAt time.Time
 
 	// The manifest (manifest.go).
-	sendMu       sync.Mutex
+	sendMu       sendLock
 	base         *Manifest
 	attached     bool
 	gen, sentGen uint64
@@ -111,6 +113,7 @@ type Client struct {
 
 	life     lifeState     // lifecycle.go: background work, and Close
 	vouchers voucherMemory // vouchers.go: subscribe vouchers' contexts
+	forms    formSessions  // clientrequests.go: the sessions a form was shown in
 
 	// posts are the requests Handler is serving, by the token it gave
 	// each (handler.go).
@@ -136,6 +139,7 @@ type options struct {
 	http       *http.Client
 	logger     *slog.Logger
 	maxRetries int
+	calls      CallTimeouts
 	required   bool
 }
 
@@ -162,6 +166,18 @@ func WithLogger(l *slog.Logger) Option { return func(o *options) { o.logger = l 
 // (default 2; 0 turns retries off). A retried emit can't wake twice.
 func WithMaxRetries(n int) Option { return func(o *options) { o.maxRetries = n } }
 
+// WithCallTimeouts bounds the requests a tool call waits on, each a total
+// deadline with no retries: Subscribe for Subscribe, Unsubscribe and
+// ResolveSession (default 5 seconds), Block for the addition to the
+// tool's result and each rollback of a failed call (default 1 second). A
+// zero field is its default. Past it the request fails with CodeTimeout;
+// a failed addition never changes the tool's result. After 5 failures in
+// a row (unreachable, a timeout or a 5xx), these requests are skipped for
+// 30 seconds (CodeUnreachable at once, logged as core_unavailable), so
+// tool calls go on without Wakeshift. Emits, watches and the rest keep
+// the HTTP client's timeout and WithMaxRetries.
+func WithCallTimeouts(t CallTimeouts) Option { return func(o *options) { o.calls = t } }
+
 // Required makes a missing key an error, for a server that must have
 // Wakeshift on.
 func Required() Option { return func(o *options) { o.required = true } }
@@ -181,12 +197,21 @@ func New(opts ...Option) (*Client, error) {
 	if o.maxRetries < 0 {
 		return nil, usage(CodeConfig, "WithMaxRetries(%d): the max retries is 0 or more", o.maxRetries)
 	}
+	if o.calls.Subscribe < 0 || o.calls.Block < 0 {
+		return nil, usage(CodeConfig, "WithCallTimeouts(Subscribe %s, Block %s): each timeout is 0 (the default) or more", o.calls.Subscribe, o.calls.Block)
+	}
+	if o.calls.Subscribe == 0 {
+		o.calls.Subscribe = defaultCallTimeouts.Subscribe
+	}
+	if o.calls.Block == 0 {
+		o.calls.Block = defaultCallTimeouts.Block
+	}
 	where := "WithKey"
 	if !o.keySet {
 		o.key, where = os.Getenv("WAKESHIFT_KEY"), "WAKESHIFT_KEY"
 	}
 	o.key = strings.TrimSpace(o.key)
-	c := &Client{http: o.http, lg: o.logger, maxRetries: o.maxRetries, now: time.Now}
+	c := &Client{http: o.http, lg: o.logger, maxRetries: o.maxRetries, calls: o.calls, now: time.Now}
 	switch {
 	case o.key == "" && o.required:
 		if where == "WithKey" {

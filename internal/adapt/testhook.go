@@ -7,6 +7,7 @@ package adapt
 import (
 	"context"
 	"encoding/json"
+	"time"
 )
 
 // StandInOp is one Subscribe or Unsubscribe of a stand-in call.
@@ -38,6 +39,12 @@ type StandIn struct {
 	// (op.Unsubscribe) returns, and is called once per Subscribe or
 	// Unsubscribe; nil: it goes ahead.
 	Fail func(op StandInOp) error
+	// NoWakes: Wakeshift can't wake the call's conversation, so Wakes stays
+	// false after a Subscribe.
+	NoWakes bool
+	// CallLimit is the program's per-call limit a Subscribe sets (0: not
+	// known); never for a Native call.
+	CallLimit time.Duration
 }
 
 var (

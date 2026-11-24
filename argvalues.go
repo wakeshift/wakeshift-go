@@ -1,7 +1,7 @@
 package wakeshift
 
 // Routing argument values are a-z 0-9 . _ -, at most 100 characters
-// (design §2.13); Wakeshift refuses anything else and never rewrites a
+// Wakeshift refuses anything else and never rewrites a
 // value. Lowercasing a case-sensitive ID makes two IDs one, so
 // EncodeArgValue encodes any string injectively instead (arg-values.json).
 

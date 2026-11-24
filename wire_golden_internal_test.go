@@ -306,8 +306,8 @@ func TestWhoMaySubscribeWireGolden(t *testing.T) {
 				user = *c.User
 			}
 			_, e := ws.rpc(t, user, ua, c.Method, c.Params)
-			if e == nil || e["code"] != c.Error.Code[dialect] || e["message"] != c.Error.Message || e["data"] != c.Error.Data {
-				t.Errorf("%s (%s): %v, want %v %q", c.Name, dialect, e, c.Error.Code[dialect], c.Error.Message)
+			if e == nil || e["code"] != c.Error.Code[dialect] || e["message"] != c.Error.Message || !reflect.DeepEqual(e["data"], c.Error.Data) {
+				t.Errorf("%s (%s): %v, want %v %q %v", c.Name, dialect, e, c.Error.Code[dialect], c.Error.Message, c.Error.Data)
 			}
 			if after := ws.askedPaths(); len(after) != before {
 				t.Errorf("%s (%s): asked Wakeshift %v", c.Name, dialect, after[before:])

@@ -1,6 +1,6 @@
 package wakeshift
 
-// Wakeshift's own tools (design §2.12): subscribe_events (for clients that
+// Wakeshift's own tools: subscribe_events (for clients that
 // don't subscribe with MCP Events themselves, listed only when an event is
 // open to it), unsubscribe_events and list_subscriptions (for everyone).
 // Their wording is the same in every SDK (event-tools.json, wording.go).

@@ -1,12 +1,12 @@
 package wakeshift
 
-// MCP Events for clients that speak it (docs/mcp-events-bridge.md), at the
+// MCP Events for clients that speak it, at the
 // HTTP layer (Handler): the events capability on server/discover and
 // initialize (under both the draft's extension key and the top-level key
 // ChatGPT reads), events/list, and events/subscribe, events/unsubscribe and
 // events/poll passed to Wakeshift, which verifies the client's callback and
 // POSTs occurrences to it, signed, in order. A tools-only event is refused
-// here, on every request (design §3); so is a native client without a
+// here, on every request; so is a native client without a
 // user, and one an event's Authorize refuses, asked on every request.
 
 import (
@@ -19,23 +19,31 @@ import (
 	"errors"
 	"maps"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
+	"github.com/wakeshift/wakeshift-go/internal/adapt"
 	"github.com/wakeshift/wakeshift-go/internal/mcpevents/event"
 )
 
 // serveEvents answers one events/* request.
 func (set *settings) serveEvents(w http.ResponseWriter, r *http.Request, post *postState, m rpcMessage) {
 	a := set.app
+	// The transport's standard headers come first, on every events/*
+	// method (transportRefusal).
+	if msg := transportRefusal(r.Header, m); msg != "" {
+		headerMismatch(w, m.ID, msg)
+		return
+	}
 	if m.Method == "events/list" {
 		// To a native request while the core hands out subscribe vouchers,
-		// the tools-only events too, each with a required wakeshift_voucher
-		// (docs/subscribe-vouchers.md §4.3).
+		// the tools-only events too, each with a required wakeshift_voucher.
+		// Asked first: whether push is served decides the delivery modes,
+		// and a client push wakes is decided by what it declares.
+		push := set.pushServed(r.Context())
 		var app *string
 		events := a.events()
-		if len(a.openEvents()) < len(events) && nativeClient(r, m.Params) && a.vouchersOffered(r.Context()) {
+		if len(a.openEvents()) < len(events) && nativeClient(r, m.Params, push) && a.vouchersOffered(r.Context()) {
 			name := a.appName(r.Context())
 			app = &name
 		}
@@ -43,9 +51,9 @@ func (set *settings) serveEvents(w http.ResponseWriter, r *http.Request, post *p
 		for _, t := range events {
 			switch {
 			case t.open():
-				defs = append(defs, t.definition())
+				defs = append(defs, t.definition(push))
 			case app != nil:
-				defs = append(defs, t.definitionFor(app))
+				defs = append(defs, t.definitionFor(app, push))
 			}
 		}
 		rpcResult(w, m.ID, map[string]any{"resultType": event.ResultType, "events": defs})
@@ -53,8 +61,24 @@ func (set *settings) serveEvents(w http.ResponseWriter, r *http.Request, post *p
 	}
 	var p eventParams
 	if err := json.Unmarshal(m.Params, &p); err != nil {
-		rpcError(w, m.ID, event.InvalidParams, "invalid params", nil)
-		return
+		// A name or delivery of the wrong type is refused below, each with
+		// its own message (after the headers are checked); anything else
+		// that isn't the params' shape, here.
+		var te *json.UnmarshalTypeError
+		if !errors.As(err, &te) || (te.Field != "name" && te.Field != "delivery" && te.Field != "delivery.mode") {
+			rpcError(w, m.ID, event.InvalidParams, "invalid params", nil)
+			return
+		}
+	}
+	// params.name: a non-empty string, else InvalidParams (SEP-3415's
+	// statically invalid request), once the headers are checked.
+	var named struct {
+		Name any `json:"name"`
+	}
+	json.Unmarshal(m.Params, &named)
+	nameOK := false
+	if s, ok := named.Name.(string); ok && s != "" {
+		nameOK = true
 	}
 	base := wireCall{Meta: p.Meta, UserAgent: r.Header.Get("User-Agent")}
 	if info, ok := p.Meta["io.modelcontextprotocol/clientInfo"].(map[string]any); ok {
@@ -62,20 +86,24 @@ func (set *settings) serveEvents(w http.ResponseWriter, r *http.Request, post *p
 	}
 	// The dialect before identity: a refusal needs it, and identify runs
 	// only once it's needed.
-	dialect := event.DialectOf(base.Client, base.UserAgent)
+	dialect := event.DialectOf(base.Client, base.UserAgent, p.Meta)
 	codes := event.CodesFor(dialect)
-	if h := r.Header.Get(event.NameHeader); h != "" {
-		if v, ok := event.HeaderValue(h); !ok || v != p.Name {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": m.ID, "error": map[string]any{
-				"code": event.HeaderMismatch, "message": "Header mismatch: Mcp-Name doesn't match params.name"}})
-			return
-		}
+	msg := nameHeadersRefusal(r.Header.Values(event.NameHeader), p.Name)
+	if t := a.eventByName(p.Name); msg == "" && t != nil && len(t.paramHeaders) > 0 {
+		// Mcp-Param headers, strictly (paramHeaderRefusal). Events are served
+		// only over HTTP (Handler), so there's always a request's headers.
+		msg = paramHeaderRefusal(t.paramHeaders, paramArguments(m.Params), r.Header)
+	}
+	if msg != "" {
+		headerMismatch(w, m.ID, msg)
+		return
+	}
+	if !nameOK {
+		rpcError(w, m.ID, event.InvalidParams, nameRequired, nil)
+		return
 	}
 	if m.Method == "events/stream" {
-		rpcError(w, m.ID, codes.Unsupported, "push delivery isn't offered: use a webhook (events/subscribe) or poll (events/poll)",
-			map[string]string{"feature": "deliveryMode", "value": strings.TrimPrefix(m.Method, "events/")})
+		set.serveStream(w, r, post, m.ID, p, base, codes)
 		return
 	}
 	t := a.eventByName(p.Name)
@@ -98,8 +126,10 @@ func (set *settings) serveEvents(w http.ResponseWriter, r *http.Request, post *p
 		voucher = offered
 	}
 	if m.Method == "events/poll" && !t.open() {
-		// Never a poll, voucher or not: the refusal says a webhook is the way.
-		rpcError(w, m.ID, codes.Forbidden, fill("native_tools_only_poll", "{event}", t.name), nil)
+		// Never a poll, voucher or not: a mode its events/list entry doesn't
+		// offer (Unsupported); the refusal says a webhook is the way.
+		rpcError(w, m.ID, codes.Unsupported, fill("native_tools_only_poll", "{event}", t.name),
+			map[string]string{"feature": "deliveryMode", "value": "poll"})
 		return
 	}
 	if creates && !t.open() && voucher == "" {
@@ -107,6 +137,10 @@ func (set *settings) serveEvents(w http.ResponseWriter, r *http.Request, post *p
 		return
 	}
 	p.Arguments = t.known(p.Arguments)
+	if m.Method == "events/subscribe" && p.Delivery.Mode == "" {
+		rpcError(w, m.ID, event.InvalidParams, modeRequired, nil)
+		return
+	}
 	if m.Method == "events/subscribe" && p.Delivery.Mode != "webhook" {
 		rpcError(w, m.ID, codes.Unsupported, `delivery.mode must be "webhook": the only delivery offered`,
 			map[string]string{"feature": "deliveryMode", "value": p.Delivery.Mode})
@@ -142,7 +176,11 @@ func (set *settings) serveEvents(w http.ResponseWriter, r *http.Request, post *p
 	}
 	out, _, _, err := a.nativeCall(r.Context(), t, m.Method, call, dialect, p)
 	if err != nil {
-		code, msg, data := rpcErrorOf(err, codes, t.name)
+		mode := p.Delivery.Mode
+		if m.Method == "events/poll" {
+			mode = "poll"
+		}
+		code, msg, data := rpcErrorOf(err, codes, t.name, mode)
 		rpcError(w, m.ID, code, msg, data)
 		return
 	}
@@ -181,12 +219,11 @@ func (id Identity) apply(call wireCall) wireCall {
 	return call
 }
 
-// nativeClient reports whether the request comes from a client that
-// subscribes with MCP Events itself: one that declares the extension in
-// its capabilities (the request's _meta, as stateless clients send them),
-// or that is known to (ChatGPT); never a harness Wakeshift wakes itself
-// (bridgedClient).
-func nativeClient(r *http.Request, params json.RawMessage) bool {
+// nativeClient reports whether an HTTP request comes from a client that
+// subscribes with MCP Events itself (nativeClientRule), from what the
+// request carries: Handler sees no session's initialize.
+// servesPush: push is listed for this request (nativeClientRule).
+func nativeClient(r *http.Request, params json.RawMessage, servesPush bool) bool {
 	var p struct {
 		Meta map[string]any `json:"_meta"`
 	}
@@ -195,13 +232,151 @@ func nativeClient(r *http.Request, params json.RawMessage) bool {
 	if info, ok := p.Meta["io.modelcontextprotocol/clientInfo"].(map[string]any); ok {
 		client, _ = info["name"].(string)
 	}
-	if event.DialectOf(client, r.Header.Get("User-Agent")) == event.DialectChatGPT {
-		return true
+	return nativeClientRule(client, r.Header.Get("User-Agent"), p.Meta, nil, servesPush)
+}
+
+// listsNative reports whether a tools/list comes from a client that
+// subscribes with MCP Events itself, from the request as the MCP library
+// gives it: its _meta's client name and capabilities, else its session's
+// initialize (r.Client, r.Extensions), so a legacy-protocol session that
+// declared the extension only in initialize (opencode's default config)
+// counts as the 2026-07-28 request that declares it does. Handler sees
+// only the request's _meta, not the session's initialize.
+func (at *Attachment) listsNative(ctx context.Context, r adapt.Request) bool {
+	var ua string
+	if r.Header != nil {
+		ua = r.Header.Get("User-Agent")
 	}
-	if bridgedClient(client, r.Header.Get("User-Agent")) {
-		return false
+	return nativeClientRule(r.Client, ua, r.Meta, r.Extensions, at.set.servesPushFor(ctx, r.Client, ua, r.Meta))
+}
+
+// requestClient is the client name a request's params carry (_meta's
+// clientInfo) and its User-Agent.
+func requestClient(r *http.Request, params json.RawMessage) (client, userAgent string) {
+	client, _ = messageClient(params)
+	return client, r.Header.Get("User-Agent")
+}
+
+// nativeClientRule is whether a client subscribes with MCP Events itself,
+// the one rule on every path (tools/list, events/list, call.subscribe,
+// after the app's IsNativeClient) and in every SDK: the client table
+// (event.EvaluateClient), pinned by
+// sdk/typescript/test/mcp-events-interop.json native_client. Its first
+// matching entry decides (ChatGPT's desktop app never; ChatGPT and OpenClaw
+// without declaring; a harness Wakeshift wakes itself never); otherwise a
+// client that declares the extension, in the request's _meta or its
+// session's initialize (sessionExtensions, nil without one). servesPush:
+// push would be listed for this request (events/list's rule); then the
+// table's without_push entries (opencode) stop applying, and capabilities
+// decide.
+func nativeClientRule(client, userAgent string, meta, sessionExtensions map[string]any, servesPush bool) bool {
+	return event.EvaluateClient(event.ClientInput{Client: client, UserAgent: userAgent, Meta: meta,
+		SessionExtensions: sessionExtensions, ServesPush: servesPush}).Native
+}
+
+// headerMismatch answers a request refused for its headers: HTTP 400 and
+// HeaderMismatch (-32020), as the 2026-07-28 transport's Server Validation
+// has it.
+func headerMismatch(w http.ResponseWriter, id json.RawMessage, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{
+		"code": event.HeaderMismatch, "message": msg}})
+}
+
+// modernProtocol is the first protocol version whose requests carry
+// MCP-Protocol-Version and Mcp-Method on every request, and _meta's
+// protocolVersion (go-sdk compares versions as strings too).
+const modernProtocol = "2026-07-28"
+
+// transportRefusal is why an events/* request is refused for the
+// 2026-07-28 Streamable HTTP transport's standard headers (HTTP 400,
+// HeaderMismatch), or "": Handler answers these methods before the MCP
+// library, so its own checks never run on them. A request whose _meta
+// names a protocol version needs MCP-Protocol-Version, equal to it; a
+// 2026-07-28 request (the header or _meta says so) needs Mcp-Method; and
+// an Mcp-Method that's sent, on any request, must be the body's method,
+// exactly. A legacy request (an initialize session's) may leave Mcp-Method
+// out. The same rule in every SDK (sdk/typescript/test/mcp-events-interop.json
+// transport_headers).
+func transportRefusal(h http.Header, m rpcMessage) string {
+	var p struct {
+		Meta map[string]any `json:"_meta"`
 	}
-	caps, _ := p.Meta["io.modelcontextprotocol/clientCapabilities"].(map[string]any)
+	json.Unmarshal(m.Params, &p)
+	metaVersion, _ := p.Meta["io.modelcontextprotocol/protocolVersion"].(string)
+	versions := h.Values("MCP-Protocol-Version")
+	if len(versions) > 1 {
+		return "Header mismatch: more than one MCP-Protocol-Version header"
+	}
+	version := ""
+	if len(versions) == 1 {
+		version = strings.Trim(versions[0], " \t")
+	}
+	if metaVersion != "" {
+		if len(versions) == 0 {
+			return "Header mismatch: MCP-Protocol-Version is missing"
+		}
+		if version != metaVersion {
+			return "Header mismatch: MCP-Protocol-Version doesn't match _meta's protocolVersion"
+		}
+	}
+	modern := version >= modernProtocol || metaVersion >= modernProtocol
+	methods := h.Values("Mcp-Method")
+	switch {
+	case len(methods) > 1:
+		return "Header mismatch: more than one Mcp-Method header"
+	case len(methods) == 0:
+		if modern {
+			return "Header mismatch: Mcp-Method is missing"
+		}
+	case strings.Trim(methods[0], " \t") != m.Method:
+		return "Header mismatch: Mcp-Method doesn't match the method"
+	}
+	return ""
+}
+
+// streamRefusal is events/stream's answer, Unsupported with value "push",
+// where push isn't served.
+const streamRefusal = "push delivery isn't offered: use a webhook (events/subscribe) or poll (events/poll)"
+
+// nameHeadersRefusal is nameHeaderRefusal over every Mcp-Name field the
+// request has: more than one is refused, since a gateway may read another
+// than the one checked here.
+func nameHeadersRefusal(values []string, name string) string {
+	if len(values) > 1 {
+		return "Header mismatch: more than one Mcp-Name header"
+	}
+	if len(values) == 0 {
+		return ""
+	}
+	return nameHeaderRefusal(values[0], name)
+}
+
+// nameHeaderRefusal is why an events/subscribe, events/unsubscribe,
+// events/poll or events/stream over HTTP is refused for its Mcp-Name
+// header (HTTP 400, HeaderMismatch), or "" if it isn't: one that's sent
+// must decode (event.HeaderValue) to params.name, from any client, whatever
+// it claims to be. A missing one is accepted from every client: SEP-3415
+// and SEP-2243 say every client must send it, but ChatGPT, OpenClaw, the
+// Vercel AI SDK, Hermes and Mastra don't yet (a documented deviation).
+// header: the request's Mcp-Name ("" for none). The same rule in every SDK
+// (sdk/typescript/test/mcp-events-interop.json mcp_name).
+func nameHeaderRefusal(header, name string) string {
+	if header == "" {
+		return ""
+	}
+	if v, ok := event.HeaderValue(strings.Trim(header, " \t")); !ok || v != name {
+		return "Header mismatch: Mcp-Name doesn't match params.name"
+	}
+	return ""
+}
+
+// declaresEventsExtension reports whether a request's _meta declares the
+// MCP Events extension in its capabilities, as a 2026-07-28 client does
+// on every request.
+func declaresEventsExtension(meta map[string]any) bool {
+	caps, _ := meta["io.modelcontextprotocol/clientCapabilities"].(map[string]any)
 	ext, _ := caps["extensions"].(map[string]any)
 	_, ok := ext[event.ExtensionKey]
 	return ok
@@ -217,11 +392,13 @@ type eventParams struct {
 		URL    string `json:"url"`
 		Secret string `json:"secret,omitempty"`
 	} `json:"delivery"`
-	TTLMs     *int64         `json:"ttlMs"`
-	Cursor    *string        `json:"cursor"`
-	MaxAgeMs  *int64         `json:"maxAgeMs"`
-	MaxEvents *int           `json:"maxEvents"`
-	Meta      map[string]any `json:"_meta"`
+	TTLMs     *int64  `json:"ttlMs"`
+	Cursor    *string `json:"cursor"`
+	MaxAgeMs  *int64  `json:"maxAgeMs"`
+	MaxEvents *int    `json:"maxEvents"`
+	// HeartbeatMs is events/stream's heartbeat suggestion.
+	HeartbeatMs *int64         `json:"heartbeatMs"`
+	Meta        map[string]any `json:"_meta"`
 	// voucher is the subscribe voucher the client passed for a tools-only
 	// event (wakeshift_voucher, taken out of Arguments), sent as voucher.
 	voucher string
@@ -337,10 +514,20 @@ func (c *Client) pollCall(ctx context.Context, call wireCall, p eventParams) (ma
 // rpcInternal is JSON-RPC's internal error.
 const rpcInternal = -32603
 
+// nameRequired and modeRequired are the InvalidParams messages for a
+// request without params.name, and an events/subscribe without
+// delivery.mode (sdk/typescript/test/mcp-events-wire.json next.refused).
+const (
+	nameRequired = "params.name is required: the name of the event"
+	modeRequired = `delivery.mode is required: "webhook", the only delivery offered`
+)
+
 // rpcErrorOf is the JSON-RPC error for a failed call, in the client's
 // dialect's codes. A conversation that isn't the caller's is Forbidden,
-// whether it exists or not, so a handle can't be probed.
-func rpcErrorOf(err error, codes event.Codes, name string) (code int, msg string, data any) {
+// whether it exists or not, so a handle can't be probed. mode: the
+// delivery mode the request asked for ("poll" for events/poll, the
+// delivery's for events/subscribe), which Unsupported names.
+func rpcErrorOf(err error, codes event.Codes, name, mode string) (code int, msg string, data any) {
 	if errors.Is(err, errNoSubscription) {
 		return codes.NotFound, "no subscription matches that event, arguments and delivery URL", map[string]string{"kind": "subscription"}
 	}
@@ -350,19 +537,28 @@ func rpcErrorOf(err error, codes event.Codes, name string) (code int, msg string
 	}
 	switch e.Code {
 	case "bad_voucher":
-		// One answer, whatever the reason (docs/subscribe-vouchers.md §6.2).
+		// One answer, whatever the reason.
 		return codes.Forbidden, fill("native_bad_voucher", "{event}", name), nil
 	case "callback_failed":
+		if e.hint != nil { // the core's, as it is (an unreachable callback)
+			return codes.CallbackEndpoint, e.Message, map[string]any{"reason": e.Reason, "hint": e.hint.data}
+		}
 		return codes.CallbackEndpoint, e.Message, map[string]string{"reason": e.Reason}
-	case "unknown_event":
+	case "unknown_event", "not_found":
 		return codes.NotFound, e.Message, map[string]string{"kind": "event"}
 	case "unsupported":
-		return codes.Unsupported, e.Message, map[string]string{"feature": "deliveryMode"}
+		if mode == "" {
+			return codes.Unsupported, e.Message, map[string]string{"feature": "deliveryMode"}
+		}
+		return codes.Unsupported, e.Message, map[string]string{"feature": "deliveryMode", "value": mode}
 	case "subscription_limit":
 		return codes.ResourceExhausted, e.Message, map[string]string{"limit": "subscriptions"}
 	case "subscription_stopped":
 		return codes.Forbidden, e.Message, map[string]string{"reason": "stopped"}
 	case "bad_request", "bad_arguments":
+		if e.hint != nil {
+			return event.InvalidParams, e.Message, map[string]any{"hint": e.hint.data}
+		}
 		return event.InvalidParams, e.Message, nil
 	case "unknown_session", "other_client", "unknown_conversation":
 		return codes.Forbidden, "another client of yours holds that subscription", nil
@@ -453,7 +649,7 @@ func (set *settings) withEventsCapability(ctx context.Context, b []byte) []byte 
 	}
 	// Any event: one open to MCP Events clients, or a tools-only one, which
 	// a native client subscribes to with the subscribe voucher a tool handed
-	// it, while the core hands them out (docs/subscribe-vouchers.md §4.3).
+	// it, while the core hands them out.
 	if len(set.app.events()) == 0 {
 		return b
 	}
@@ -512,24 +708,4 @@ func addEventsCapability(b []byte) []byte {
 		return b
 	}
 	return out
-}
-
-// bridgedClients are the harnesses Wakeshift wakes through its own paths (a
-// Monitor, hooks, a connector, a plugin), by MCP clientInfo name or HTTP
-// User-Agent product token, compared case-insensitively
-// (internal/harnesses). A call from one is never treated as a native MCP
-// Events client, whatever capabilities it declares: Claude Code, for one,
-// isn't woken by MCP Events, so treating it as native would leave it with
-// nothing listening. The same list in every SDK.
-var bridgedClients = []string{"claude-code", "codex-mcp-client", "cursor", "cursor-vscode", "copilot-cli", "opencode", "antigravity-client", "openclaw-bundle-mcp", "hermes-agent", "capy", "muse-custom-connector"}
-
-// bridgedClient reports whether a client is one of bridgedClients, by its
-// clientInfo name or its User-Agent's first product token.
-func bridgedClient(client, userAgent string) bool {
-	if slices.Contains(bridgedClients, strings.ToLower(strings.TrimSpace(client))) {
-		return true
-	}
-	product, _, _ := strings.Cut(userAgent, "/")
-	product = strings.ToLower(strings.TrimSpace(product))
-	return product != "" && slices.Contains(bridgedClients, product)
 }

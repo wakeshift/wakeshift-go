@@ -96,6 +96,27 @@ crawlFinished, err = wakeshift.DefineEvent(wake, "crawl.finished", wakeshift.Eve
 
 It backs off on errors, stops at its timeout, emits with one ID across retries, and runs one watch per event and arguments. It lives in this process: a restart, a frozen serverless instance, or a stdio server's agent closing it ends it.
 
+## Push to MCP Events clients
+
+Where Wakeshift serves MCP Events push, a client that speaks MCP Events (opencode, Mastra, an app's own agents) can hold an `events/stream` request open on your server and get each occurrence as it happens. `attached.Handler` serves it: it opens one stream to Wakeshift per request and relays it, so your server keeps nothing between requests and any instance can serve a reconnect. It's on by default over HTTP; over stdio clients poll instead.
+
+```go
+opts := wakeshift.AttachOptions{
+	// …your Identify and the rest, as before
+	Push: wakeshift.PushOptions{MaxStream: 4 * time.Minute, MaxHeartbeat: 20 * time.Second},
+}
+```
+
+Pass `opts` to `wake.Attach`.
+
+`MaxStream` ends each stream before your host's request duration cap, and the client reconnects with its cursor, losing nothing (on Vercel, AWS Lambda and Cloud Run the SDK picks one for you). `MaxHeartbeat` keeps a load balancer with a short idle timeout from closing an idle stream. Every open stream runs `Identify` (and the event's `Authorize`, if it has one) again every `Reauthorize`, and ends as a revoked subscription does when they refuse or `Identify` no longer gives the stream's user. If they fail instead (an error, a panic, a run over 10 seconds), the stream goes on until its last successful check is 15 minutes old (three intervals, if longer), then ends, and the client reconnects with its cursor; each failed check logs `push_recheck_failed`, and the end `push_recheck_stale`. A reconnect while they fail gets a retryable error (`-32603`, logged as `push_open_check_failed`), not Forbidden, so the client retries until they answer. For `Reauthorize`, 0 means the default, 5 minutes; negative values panic. Behind a proxy that buffers responses or can't hold one open, set `Push: wakeshift.PushOff`: clients then use webhooks or poll.
+
+**Codex's install offer in its own dialog.** Where Wakeshift turns it on for your app, a subscribing call from Codex can show the user an MCP elicitation form, in Codex's own dialog, with the steps to set up notifications; the user runs them, with no step by the agent. The SDK runs it only within fixed bounds, and only where the session can send a request to the client during the call (stdio, or streamable HTTP with sessions). Otherwise, and with `AttachOptions{DisableClientRequests: true}`, results keep Wakeshift's usual text.
+
+## Tools that wait
+
+A tool that waits for its work without Wakeshift keeps that wait unless `call.Wakes()` is true after `Subscribe`. When the agent asks for a wait longer than its program lets one tool call run (`call.CallLimit()`: Claude Code 60 seconds, Codex 300), `call.ShouldSkipWait(wait)` is true for a conversation Wakeshift wakes: return at once with a plain status, and keep the subscription. Don't promise the wake in your own text: Wakeshift's addition tells the agent.
+
 ## Unit tests
 
 `github.com/wakeshift/wakeshift-go/wakeshifttest` tests your tools offline: `wakeshifttest.NewClient()` is an enabled client answered by a fake Wakeshift in memory, recording what you emit and subscribe; `wakeshifttest.NewToolCall(…)` is a stand-in call for invoking a handler directly; `ContextWithCall` serves a tool named in `Wrap`. To keep a real client off in tests while `WAKESHIFT_KEY` is set, use `wakeshift.New(wakeshift.WithKey(""))`. With a key, tools/list and the capabilities gain Wakeshift's tools and arguments, so update any snapshot of them taken without one (`wakeshift.BuiltinToolNames()` names Wakeshift's tools).
@@ -107,6 +128,7 @@ It backs off on errors, stops at its timeout, emits with one ID across retries, 
 | Go | 1.25 or later |
 | [go-sdk](https://github.com/modelcontextprotocol/go-sdk) | v1.8 or later |
 | [mcp-go](https://github.com/mark3labs/mcp-go) | v1.0 or later, through `github.com/wakeshift/wakeshift-go/mcpgo` (adding the SDK keeps your version) |
+| MCP Events | As accepted (SEP-3415): webhook, poll and push (`events/stream`) for clients that subscribe natively, served over HTTP by `attached.Handler`, not over stdio. `AttachOptions{Push: wakeshift.PushOff}` turns push off, and `wakeshift.PushOptions{MaxStream, MaxHeartbeat, Reauthorize}` tunes its streams (zero keeps the default) |
 
 `*Client`, `*Event` and `*Attachment` are safe for concurrent use. Create one `Client` per process. The same calls are in the [TypeScript](https://github.com/wakeshift/wakeshift-node) and [Python](https://github.com/wakeshift/wakeshift-python) SDKs. What changed between releases is in [CHANGELOG](CHANGELOG.md), and the package's reference is on [pkg.go.dev](https://pkg.go.dev/github.com/wakeshift/wakeshift-go).
 

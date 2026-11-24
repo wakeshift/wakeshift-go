@@ -1,6 +1,6 @@
 package wakeshift
 
-// Subscribe vouchers (docs/subscribe-vouchers.md §4.3, §4.4, §7): a tool
+// Subscribe vouchers: a tool
 // subscribing a native client (ChatGPT) to a tools-only event gives it a
 // native line, whose voucher the core renders; the client writes it back
 // as wakeshift_voucher, which the SDK takes out of the arguments and sends
@@ -384,6 +384,38 @@ func TestVoucherRefusalsWireGolden(t *testing.T) {
 				t.Errorf("%s: OnSubscribe ran: %v", name, got)
 			}
 			vs.noVoucherLogged(t, name)
+		}
+	}
+}
+
+// Wakeshift's refusals of a webhook subscribe: the core's message as it
+// is, its hint as data.hint beside reason, in every dialect
+// (mcp-events-wire.json core_errors).
+func TestCoreErrorsWireGolden(t *testing.T) {
+	var g struct {
+		CoreErrors struct {
+			Cases []voucherCase `json:"cases"`
+		} `json:"core_errors"`
+	}
+	readSharedFixture(t, "mcp-events-wire.json", &g)
+	if len(g.CoreErrors.Cases) == 0 {
+		t.Fatal("no core_errors cases")
+	}
+	for _, c := range g.CoreErrors.Cases {
+		for dialect, ua := range voucherUAs {
+			name := c.Name + " (" + dialect + ")"
+			vs := newVoucherServer(t, featureOn, map[string]voucherReply{"/events/subscribe": {c.CoreStatus, c.CoreBody}})
+			_, e := vs.rpc(t, strp(c.User), ua, c.Method, c.Params)
+			want := c.Error
+			if e == nil || e["code"] != want.Code[dialect] || e["message"] != want.Message || !reflect.DeepEqual(canonical(t, e["data"]), canonical(t, want.Data)) {
+				t.Errorf("%s: %v, want %v %q %v", name, e, want.Code[dialect], want.Message, want.Data)
+			}
+			if msg, _ := e["message"].(string); strings.Contains(msg, "again") || strings.Contains(msg, "retry") {
+				t.Errorf("%s: the refusal asks for a retry: %q", name, msg)
+			}
+			if got := vs.settled(); len(got) != 0 {
+				t.Errorf("%s: OnSubscribe ran: %v", name, got)
+			}
 		}
 	}
 }

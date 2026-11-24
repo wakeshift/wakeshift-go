@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // noRepeat matches a note asking the agent to call the app's tool again
@@ -63,6 +64,30 @@ func TestNoNoteAsksForAnotherCall(t *testing.T) {
 	} {
 		notes[name] = n
 	}
+	// Grok Bot's webhook notes, every state.
+	const ch, fg = "0b8f3c1e-2d4a-4b6c-8e0f-1a2b3c4d5e6f", "FOREGROUND."
+	in := GrokInstall{Base: base, Command: "INSTALL-COMMAND"}
+	for name, n := range map[string]string{
+		"GrokKeyNote":            GrokKeyNote(app, in, "bot-1", ch, fg),
+		"GrokWebhookNote":        GrokWebhookNote(app, base, "bot-1", link, 24*time.Hour, fg),
+		"GrokJoinedNote":         GrokJoinedNote(app),
+		"GrokKeyMissingNote":     GrokKeyMissingNote(app, in, "bot-1", ch, fg),
+		"GrokKeyMissingLiveNote": GrokKeyMissingLiveNote(app, in, "bot-1", ch),
+		"GrokRekeyNote":          GrokRekeyNote("0123456789abcdef", "fedcba9876543210", link, fg),
+		"GrokBadSignatureNote":   GrokBadSignatureNote,
+		"GrokChallengeGone":      GrokChallengeGone,
+		"GrokPrivateKeyNote":     GrokPrivateKeyNote,
+		"GrokBoundNote":          GrokBoundNote(app),
+		"GrokSetupFailedNote":    GrokSetupFailedNote,
+		"GrokSetupMismatchNote":  GrokSetupMismatchNote,
+		"GrokRegisteredNote":     GrokRegisteredNote(app),
+		"GrokPendingNote":        GrokPendingNote(app, link, time.Now(), in, "bot-1", ch, fg),
+		"GrokDeadNote":           GrokDeadNote(app, "unauthorized", in, "bot-1", ch, link, 24*time.Hour, fg),
+		"GrokStoppedLine":        GrokStoppedLine(app, "not_found"),
+		"GrokRoutineInstruction": GrokRoutineInstruction(base, "bot-1"),
+	} {
+		notes[name] = n
+	}
 	// Every harness is covered, these two by name: they came after the
 	// rule and once had a narrower workaround of their own.
 	for _, id := range []string{"capy", "muse"} {
@@ -97,10 +122,10 @@ func TestNoNoteAsksForAnotherCall(t *testing.T) {
 			}
 		}
 		for name, n := range map[string]string{
-			"BackgroundNote":        BackgroundNote(h, app, url, true),
-			"BackgroundNote known":  BackgroundNote(h, app, url, false),
-			"BackgroundAgainNote":   BackgroundAgainNote(h, app, url, true, false),
-			"BackgroundRunningNote": BackgroundRunningNote(h, app, url),
+			"BackgroundNote":        BackgroundNote(h, app, url, Claim{}, true),
+			"BackgroundNote known":  BackgroundNote(h, app, url, Claim{}, false),
+			"BackgroundAgainNote":   BackgroundAgainNote(h, app, url, Claim{}, true, false),
+			"BackgroundRunningNote": BackgroundRunningNote(h, app, url, Claim{}),
 			"ForegroundNote":        ForegroundNote(h, app, url, true),
 			"WaitNote":              WaitNote(h, app, "~/.wakeshift/bin/wakeshift wait", true),
 			"WaitAgainNote":         WaitAgainNote(h, app, "~/.wakeshift/bin/wakeshift wait", true),

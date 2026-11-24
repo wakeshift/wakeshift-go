@@ -5,10 +5,11 @@ package wakeshift
 // MCP SDK has finished (the output validated, structuredContent and the
 // JSON text fallback filled), it decides from the final result whether the
 // call failed, and either rolls back the subscriptions the call made or adds
-// the call's one block (docs/subscribe-from-tools.md, "Wrapper behavior").
+// the call's one block.
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -21,9 +22,6 @@ import (
 
 // connectorMetaKey is where a tool result carries a connector beacon.
 const connectorMetaKey = "wakeshift/connector"
-
-// rollbackTimeout bounds a rollback's requests, which outlive the call.
-const rollbackTimeout = 15 * time.Second
 
 // finish ends a wrapped tool's call once its final result is known: a call
 // that failed has its subscriptions rolled back; one that didn't gets the
@@ -40,7 +38,7 @@ func (at *Attachment) finish(ctx context.Context, s *callScope, failed bool) (bl
 	blk, has, err := at.blockFor(ctx, s)
 	if err != nil && !s.armed && len(s.created) == 0 && len(s.native) > 0 {
 		// Only native lines, so nothing to roll back: the tool's result goes
-		// out as it would without Wakeshift (docs/subscribe-vouchers.md §7.2).
+		// out as it would without Wakeshift.
 		at.app.logOnce(ctx, "native_unavailable", s.call.Tool+"\x00addition_failed",
 			fmt.Sprintf("Wakeshift's addition to a result of %s failed, so it carries no line for the MCP Events client", s.call.Tool),
 			slog.String("tool", s.call.Tool), slog.String("event", s.native[0].Name), slog.String("reason", "addition_failed"))
@@ -73,12 +71,11 @@ func (at *Attachment) rollback(ctx context.Context, s *callScope) {
 	if len(s.created) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
-	defer cancel()
+	ctx = context.WithoutCancel(ctx)
 	for _, c := range s.created {
 		wire := s.call.wire()
 		wire.Session = c.session
-		if err := at.app.eventsCall(ctx, "POST", "/api/apps/v1/event-subscriptions/unsubscribe",
+		if err := at.app.inCall(ctx, at.app.blockBudget(), "POST", "/api/apps/v1/event-subscriptions/unsubscribe",
 			map[string]any{"call": wire, "name": c.name, "arguments": c.arguments, "reason": "rolled_back", "pending": c.pending}, nil); err != nil {
 			at.app.logLimited(ctx, "rollback_failed", fmt.Sprintf("ending a subscription of a failed call of %s failed (%s)", s.call.Tool, errorType(err)),
 				slog.String("tool", s.call.Tool), slog.String("event", c.name))
@@ -112,16 +109,30 @@ func (at *Attachment) blockFor(ctx context.Context, s *callScope) (blk adapt.Blo
 	return blk, true, nil
 }
 
-// fetchBlock is the call's block from /calls/addition (blockFor).
+// fetchBlock is the call's block from /calls/addition (blockFor), within
+// the Block budget. A native call waits for the manifest's answer first,
+// within the Subscribe budget: see below.
 func (at *Attachment) fetchBlock(ctx context.Context, s *callScope) (blk adapt.Block, has bool, err error) {
 	if s.call.Native {
 		// The manifest's answer first, so a native call's wire knows whether
-		// the core hands out vouchers.
-		at.app.vouchersOffered(ctx)
+		// the core hands out vouchers. A native call makes no subscribe
+		// request, so on a fresh process this is its first wait for the
+		// manifest: it gets the Subscribe budget, as a bridged call's
+		// Subscribe does, and the addition then its own Block budget (at
+		// most Subscribe + Block in all, as for a bridged call).
+		at.app.vouchersOfferedBy(ctx, time.Now().Add(at.app.subscribeBudget()))
 	}
+	deadline := time.Now().Add(at.app.blockBudget())
 	wire := s.call.wire()
 	if s.pending == "" && len(s.native) == 0 && wire.Session == "" && wire.Conversation == "" && conversationKey(wire.Meta) == "" {
 		return adapt.Block{}, false, nil
+	}
+	// The kinds of client request this call can run (clientrequests.go),
+	// only for a call that subscribed: the core describes one only for a
+	// subscribing call's first ask.
+	offered := s.offersRequests()
+	if offered {
+		wire.ClientRequests = []string{elicitForm}
 	}
 	body := map[string]any{"call": wire}
 	if s.pending != "" {
@@ -134,8 +145,13 @@ func (at *Attachment) fetchBlock(ctx context.Context, s *callScope) (blk adapt.B
 		Text    string         `json:"text"`
 		Trailer string         `json:"trailer"`
 		Meta    map[string]any `json:"meta"`
+		// Requests are client requests for the SDK to run: only the first
+		// is (clientrequests.go).
+		Requests []json.RawMessage `json:"requests"`
 	}
-	if err := at.app.eventsCall(ctx, "POST", "/api/apps/v1/calls/addition", body, &add); err != nil {
+	if err := at.app.inCallBy(ctx, deadline, func(ctx context.Context) error {
+		return at.app.eventsCall(ctx, "POST", "/api/apps/v1/calls/addition", body, &add)
+	}); err != nil {
 		if s.armed || len(s.native) > 0 {
 			return adapt.Block{}, false, err
 		}
@@ -146,13 +162,17 @@ func (at *Attachment) fetchBlock(ctx context.Context, s *callScope) (blk adapt.B
 		// for the redemption's OnSubscribe (vouchers.go).
 		at.app.rememberVouchers(add.Text, s.native)
 	}
-	return adapt.Block{Text: strings.TrimSpace(add.Text), Trailer: add.Trailer, Meta: add.Meta}, true, nil
+	blk = adapt.Block{Text: strings.TrimSpace(add.Text), Trailer: add.Trailer, Meta: add.Meta}
+	if len(add.Requests) > 0 {
+		blk = at.runRequest(ctx, s, blk, add.Requests[0], offered)
+	}
+	return blk, true, nil
 }
 
 // applyBlock adds the call's block to out, and its text to a structured
 // result's wakeshift field.
 func (at *Attachment) applyBlock(s *callScope, out *mcp.CallToolResult, blk adapt.Block) {
-	mergeBlock(out, blk.Text, blk.Trailer, blk.Meta)
+	mergeBlock(out, blk)
 	if blk.Text == "" || out.StructuredContent == nil {
 		return
 	}
@@ -160,20 +180,24 @@ func (at *Attachment) applyBlock(s *callScope, out *mcp.CallToolResult, blk adap
 }
 
 // mergeBlock adds Wakeshift's text to res as a block after the app's
-// content, then a text-carried beacon as the last line, and _meta. Beacon
-// lines ending the app's own text are dropped (dropTrailers). A result
-// whose own _meta carries a connector beacon gets no second one, in _meta
-// or its text.
-func mergeBlock(res *mcp.CallToolResult, text, trailer string, meta map[string]any) {
+// content (before it, for a client request's outcome placed "before"),
+// then a text-carried beacon as the last line, and _meta. Beacon lines
+// ending the app's own text are dropped (dropTrailers). A result whose own
+// _meta carries a connector beacon gets no second one, in _meta or its
+// text.
+func mergeBlock(res *mcp.CallToolResult, blk adapt.Block) {
 	_, metaBeacon := res.Meta[connectorMetaKey]
 	dropTrailers(res)
-	if text != "" {
-		res.Content = append(res.Content, &mcp.TextContent{Text: text})
+	switch {
+	case blk.Text != "" && blk.Placement == placementBefore:
+		res.Content = append([]mcp.Content{&mcp.TextContent{Text: blk.Text}}, res.Content...)
+	case blk.Text != "":
+		res.Content = append(res.Content, &mcp.TextContent{Text: blk.Text})
 	}
-	if !metaBeacon && trailer != "" {
-		res.Content = append(res.Content, &mcp.TextContent{Text: trailer})
+	if !metaBeacon && blk.Trailer != "" {
+		res.Content = append(res.Content, &mcp.TextContent{Text: blk.Trailer})
 	}
-	for k, v := range meta {
+	for k, v := range blk.Meta {
 		if k == connectorMetaKey && metaBeacon {
 			continue
 		}

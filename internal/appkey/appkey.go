@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"hash/crc32"
 	"math/big"
@@ -134,6 +135,32 @@ func Format(seed []byte) string {
 		out[i] = alphabet[m.Int64()]
 	}
 	return Prefix + string(out)
+}
+
+// ErrAppID is a server-registered app's ID that isn't one.
+var ErrAppID = errors.New("an app ID is 2 to 40 lowercase letters, digits and dashes, starting with a letter")
+
+// ForServer registers an app with a server you run yourself, by the key
+// made from seed (32 bytes): the key its SDK takes (WAKESHIFT_KEY, a new
+// key) and the server's WAKESHIFT_APPS, a JSON list with the one app, its
+// public key in base64. name defaults to id. cmd/appkey -app prints these,
+// and the release gate (internal/releasegate) starts its server with them.
+func ForServer(id, name string, seed []byte) (key, apps string, err error) {
+	if !appIDRE.MatchString(id) {
+		return "", "", ErrAppID
+	}
+	if len(seed) != ed25519.SeedSize {
+		return "", "", errors.New("an app key's seed is 32 bytes")
+	}
+	if name == "" {
+		name = id
+	}
+	pub := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
+	b, err := json.Marshal([]map[string]string{{"id": id, "name": name, "public_key": base64.StdEncoding.EncodeToString(pub)}})
+	if err != nil {
+		return "", "", err
+	}
+	return Format(seed), string(b), nil
 }
 
 // FormatOld writes an old key: mode, the app's ID and the seed.

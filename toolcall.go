@@ -1,6 +1,6 @@
 package wakeshift
 
-// One call of a tool that subscribes (design §2.4, §2.5): its *ToolCall,
+// One call of a tool that subscribes: its *ToolCall,
 // which event.Subscribe takes to subscribe the calling conversation. The
 // attachment adds one Wakeshift block to whatever the tool returns, so a
 // conversation can't be left unwakeable by a forgotten argument or an
@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"reflect"
 	"slices"
 	"strings"
@@ -57,6 +58,19 @@ type ToolCall struct {
 	app      *Client      // a disabled call's
 	decl     *declaration // a disabled call's
 	stand    *standIn     // a stand-in's (wakeshifttest.NewToolCall)
+	// pushWoken: the client is one push wakes (opencode): its
+	// subscribes go to the core whatever the SDK decided, which answers
+	// native_line when it chose native push (Wakeshift's plugin doesn't
+	// listen for the conversation), and keeps the bridged path otherwise
+	// (the downgrade).
+	pushWoken bool
+	// eventsExt: the request declares the MCP Events extension (its
+	// _meta's capabilities, or its session's initialize): sent as
+	// call.events_ext.
+	eventsExt bool
+	// pushOn: this server serves push for the call, if the core does
+	// (settings.pushOn): events_ext goes only then.
+	pushOn bool
 }
 
 // Session is the conversation's session key, set once Wakeshift resolved
@@ -83,6 +97,78 @@ func (c *ToolCall) wireSession() string {
 }
 
 func (c *ToolCall) setSession(k string) { v := SessionKey(k); c.session = &v }
+
+// Wakes reports whether Wakeshift wakes this conversation for what the
+// call subscribed: skip your own polling or waiting only when it's true;
+// otherwise behave as without Wakeshift. Set by Subscribe; false before.
+//
+// It's true while a subscription a Subscribe of this call made or renewed
+// is still live (not ended by the call's Unsubscribe) and Wakeshift said
+// a wake is confirmed, as of the latest such Subscribe: the conversation's
+// agent program can be woken, with no choice from the user still to come
+// (false while Claude Code's question of how to be notified is pending); and for a native caller (a ChatGPT Work chat on the web,
+// woken through MCP Events) once a Subscribe offered it a line the call
+// didn't end. It's false for a nil call, a disabled client's call, a
+// native caller whose Subscribe came back SubscriptionUnavailable, a
+// Subscribe that returned an error, and an older Wakeshift that doesn't
+// say. Safe for concurrent use.
+func (c *ToolCall) Wakes() bool {
+	switch {
+	case c == nil || c.disabled:
+		return false
+	case c.stand != nil:
+		return c.stand.wakesNow()
+	case c.s == nil:
+		return false
+	}
+	return c.s.wakesNow()
+}
+
+// CallLimit is how long the conversation's agent program lets one tool
+// call take before it gives up on it, from what Wakeshift recognized the
+// program as (Claude Code: 60 seconds, Codex: 300), or 0 when that isn't
+// known. Set by Subscribe, from the latest that made or renewed a
+// subscription; 0 before. It's the program's default: a user's own setting
+// may raise it. Safe for concurrent use.
+func (c *ToolCall) CallLimit() time.Duration {
+	switch {
+	case c == nil || c.disabled:
+		return 0
+	case c.stand != nil:
+		return c.stand.limitNow()
+	case c.s == nil:
+		return 0
+	}
+	c.s.wmu.Lock()
+	defer c.s.wmu.Unlock()
+	return c.s.callLimit
+}
+
+// ShouldSkipWait reports whether to skip a wait the agent asked for (a
+// vendor's wait_seconds) and return at once: true only when Wakes is true
+// and wait reaches CallLimit, so the program would cut the call off before
+// the wait ends. Keep the subscription either way. A wait of 0 (none asked
+// for) is false.
+func (c *ToolCall) ShouldSkipWait(wait time.Duration) bool {
+	return skipsWait(c.Wakes(), c.CallLimit(), wait)
+}
+
+// skipsWait is ShouldSkipWait's rule (skip-wait.json): skip a wait the
+// agent asked for only when Wakeshift wakes the conversation and the wait
+// reaches the program's per-call limit.
+func skipsWait(wakes bool, limit, wait time.Duration) bool {
+	return wakes && limit > 0 && wait > 0 && wait >= limit
+}
+
+// callLimitOf is a core's call_limit in seconds as a duration, 0 for none
+// or anything but a positive number.
+func callLimitOf(raw json.RawMessage) time.Duration {
+	var secs float64
+	if len(raw) == 0 || json.Unmarshal(raw, &secs) != nil || secs <= 0 || secs > float64(math.MaxInt64/int64(time.Second)) {
+		return 0
+	}
+	return time.Duration(secs * float64(time.Second))
+}
 
 func (c *ToolCall) String() string {
 	if c == nil {
@@ -222,17 +308,28 @@ type callScope struct {
 	native  []nativeLine
 	// notes are Wakeshift's from the call's unsubscribes, for the block.
 	notes []string
+	// requestsOff: attach's DisableClientRequests (clientrequests.go).
+	requestsOff bool
 
 	// wmu guards what Watch reads of the call (it may run in another
 	// goroutine): the state of each Subscribe by event and arguments, the
 	// subscriptions the call made or renewed that are still live, the
-	// watches it started for subscriptions it created, and whether it was
-	// rolled back.
+	// watches it started for subscriptions it created, whether it was
+	// rolled back, the core's wakes from the latest Subscribe that made or
+	// renewed one, and the native lines the call offered and didn't end
+	// (Wakes).
 	wmu        sync.Mutex
 	states     map[string]SubscriptionState
 	live       map[string]bool
 	watches    map[string]context.CancelCauseFunc
 	rolledBack bool
+	wakes      bool
+	// callLimit: the core's call_limit from the latest Subscribe that made
+	// or renewed one (CallLimit).
+	callLimit time.Duration
+	// subscribeFailed: a Subscribe of the call failed, so Wakes is false (the tool keeps its own wait).
+	subscribeFailed bool
+	nativeLive      map[string]bool
 }
 
 // subKey is an event and its arguments, canonical: how the call keeps its
@@ -247,9 +344,40 @@ func (s *callScope) noteState(key string, st SubscriptionState) {
 		s.states, s.live = map[string]SubscriptionState{}, map[string]bool{}
 	}
 	s.states[key] = st
-	if st == SubscriptionCreated || st == SubscriptionRenewed {
+	switch st {
+	case SubscriptionCreated, SubscriptionRenewed:
 		s.live[key] = true
+	case SubscriptionNative:
+		if s.nativeLive == nil {
+			s.nativeLive = map[string]bool{}
+		}
+		s.nativeLive[key] = true
 	}
+}
+
+// noteNativeEnded records that an Unsubscribe of the call ended what it
+// offered a native caller.
+func (s *callScope) noteNativeEnded(key string) {
+	s.wmu.Lock()
+	delete(s.nativeLive, key)
+	s.wmu.Unlock()
+}
+
+// noteWakes records the core's wakes from a Subscribe that made or renewed
+// a subscription.
+func (s *callScope) noteWakes(w bool, limit time.Duration) {
+	s.wmu.Lock()
+	s.wakes, s.callLimit = w, limit
+	s.wmu.Unlock()
+}
+
+// wakesNow is Wakes for a call the SDK serves: the latest wakes, while a
+// subscription the call made or renewed is still live, or a native line
+// the call offered and didn't end.
+func (s *callScope) wakesNow() bool {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	return !s.rolledBack && !s.subscribeFailed && (s.wakes && len(s.live) > 0 || len(s.nativeLive) > 0)
 }
 
 // noteEnded records that an Unsubscribe of the call ended its subscription.
@@ -329,8 +457,7 @@ type nativeLine struct {
 	Arguments json.RawMessage `json:"arguments"`
 	// Subscribe's options, for a tools-only event's line: the core keeps
 	// them with the subscribe voucher and applies them when it's redeemed
-	// (docs/subscribe-vouchers.md §4.1). Seconds, as /event-subscriptions
-	// takes them.
+	// Seconds, as /event-subscriptions takes them.
 	Once   bool     `json:"once,omitempty"`
 	TTL    *float64 `json:"ttl,omitempty"`
 	Replay *float64 `json:"replay,omitempty"`
@@ -338,6 +465,21 @@ type nativeLine struct {
 	// voucher the line hands out (vouchers.go).
 	context    any
 	hasContext bool
+}
+
+// nativeLine is a native line's options from a Subscribe's: once, ttl and
+// replay, and its Context, remembered with a voucher the line hands out.
+func (o subscribeOptions) nativeLine() nativeLine {
+	line := nativeLine{Once: o.once, context: o.context, hasContext: o.context != nil}
+	if o.ttl > 0 {
+		v := o.ttl.Seconds()
+		line.TTL = &v
+	}
+	if o.replaySet {
+		v := o.replay.Seconds()
+		line.Replay = &v
+	}
+	return line
 }
 
 // maxNativeLines is the most native lines Wakeshift takes for one call.
@@ -353,6 +495,7 @@ func (at *Attachment) newScope(ctx context.Context, r adapt.Request, wake wakeAr
 	if post != nil {
 		set = post.set
 	}
+	s.requestsOff = set.noRequests
 	s.id = set.identityFor(ctx, post, requestFor(r))
 	s.id.logRequired(ctx, at.app, r.Tool)
 	c := &ToolCall{Request: s.goReq, Tool: r.Tool, s: s}
@@ -364,6 +507,14 @@ func (at *Attachment) newScope(ctx context.Context, r adapt.Request, wake wakeAr
 		c.passed = &k
 	}
 	c.Native, c.NativeConversation = at.nativeOf(ctx, set, r, s.id.id.Client)
+	ua := ""
+	if r.Header != nil {
+		ua = r.Header.Get("User-Agent")
+	}
+	c.pushWoken = pushClient(cmp.Or(r.Client, s.id.id.Client), ua, r.Meta)
+	_, sessionExt := r.Extensions[event.ExtensionKey]
+	c.eventsExt = declaresEventsExtension(r.Meta) || sessionExt
+	c.pushOn = set.pushOn()
 	s.call = c
 	return s
 }
@@ -382,19 +533,13 @@ func (s *callScope) end() {
 
 // nativeOf says whether a call comes from a client that subscribes to the
 // app's events itself, on stateless servers too (which never see
-// initialize), in this order: the app's override (IsNativeClient);
-// ChatGPT's _meta["openai/session"]; a client name (initialize's, or
-// _meta's, else Identity.Client) or User-Agent of a known native client;
-// never a harness Wakeshift wakes itself (bridgedClient: its name wins over
-// capabilities); a client that declares the MCP Events extension.
-// conversation is ChatGPT's conversation, when it names one.
+// initialize): the app's override (IsNativeClient), else nativeClientRule,
+// for the client name (initialize's, or _meta's, else Identity.Client) and
+// User-Agent. conversation is ChatGPT's conversation, when it names one.
 func (at *Attachment) nativeOf(ctx context.Context, set *settings, r adapt.Request, identified string) (native bool, conversation string) {
 	meta := r.Meta
 	conversation, _ = meta["openai/session"].(string)
 	if f := set.isNative; f != nil && f(ctx, requestFor(r)) {
-		return true, conversation
-	}
-	if conversation != "" {
 		return true, conversation
 	}
 	var ua string
@@ -405,22 +550,13 @@ func (at *Attachment) nativeOf(ctx context.Context, set *settings, r adapt.Reque
 	if r.Header != nil {
 		ua = r.Header.Get("User-Agent")
 	}
-	if event.DialectOf(client, ua) == event.DialectChatGPT {
-		return true, ""
-	}
-	if bridgedClient(client, ua) {
+	// ChatGPT's desktop app can't subscribe natively (Codex mode waits in
+	// the foreground; a regular chat is told it can't be woken), though it
+	// sends openai/session too: the rule says no before it reads that.
+	if !nativeClientRule(client, ua, meta, r.Extensions, set.servesPushFor(ctx, client, ua, meta)) {
 		return false, ""
 	}
-	if _, ok := r.Extensions[event.ExtensionKey]; ok {
-		return true, ""
-	}
-	if metaCaps, _ := meta["io.modelcontextprotocol/clientCapabilities"].(map[string]any); metaCaps != nil {
-		ext, _ := metaCaps["extensions"].(map[string]any)
-		if _, ok := ext[event.ExtensionKey]; ok {
-			return true, ""
-		}
-	}
-	return false, ""
+	return true, conversation
 }
 
 func scopeFrom(ctx context.Context) *callScope {
@@ -469,10 +605,16 @@ func noCall(name string) error {
 func (c *ToolCall) wire() wireCall {
 	s := c.s
 	call := wireOf(s.req, c.wireSession()).withArgs(s.wake).tasksIf(s.at.set.wait)
-	if c.Native && s.at.app.vouchersKnown() {
+	// Only to a core that serves push, which knows the field (an older one
+	// refuses fields it doesn't know).
+	// Only where push is served for this request (PushOff or a server
+	// whose events Wakeshift doesn't serve never gets a native push line).
+	call.EventsExt = c.eventsExt && c.pushOn && s.at.app.pushKnown()
+	if (c.Native || (call.EventsExt && c.pushWoken)) && s.at.app.vouchersKnown() {
 		// A native caller's transport session binds an anonymous voucher;
 		// only to a core that hands them out (an older one refuses fields
-		// it doesn't know).
+		// it doesn't know). A push-woken caller's native line can
+		// carry a voucher too.
 		id := ""
 		if s.req.Header != nil {
 			id = s.req.Header.Get("Mcp-Session-Id")
@@ -525,7 +667,8 @@ func (c *ToolCall) ResolveSession(ctx context.Context) (SessionKey, error) {
 		Pending string     `json:"pending"`
 		Agent   Recognized `json:"agent"`
 	}
-	if err := s.at.app.eventsCall(ctx, "POST", "/api/apps/v1/calls/session", map[string]any{"call": wire}, &out); err != nil {
+	app := s.at.app
+	if err := app.inCall(ctx, app.subscribeBudget(), "POST", "/api/apps/v1/calls/session", map[string]any{"call": wire}, &out); err != nil {
 		return "", err
 	}
 	s.pending = out.Pending
@@ -549,6 +692,30 @@ func (c *ToolCall) ResolveSession(ctx context.Context) (SessionKey, error) {
 // personal event needs a user. On a disabled client it checks its
 // arguments and returns State SubscriptionDisabled.
 func (e *Event[A, P]) Subscribe(ctx context.Context, call *ToolCall, args A, opts ...SubscribeOption) (Subscription, error) {
+	sub, err := e.subscribe(ctx, call, args, opts...)
+	if err != nil {
+		call.noteSubscribeFailed()
+	}
+	return sub, err
+}
+
+// noteSubscribeFailed records that a Subscribe of the call failed: any
+// failure makes Wakes false, so the tool keeps its own wait.
+func (c *ToolCall) noteSubscribeFailed() {
+	switch {
+	case c == nil:
+	case c.stand != nil:
+		c.stand.mu.Lock()
+		c.stand.failed = true
+		c.stand.mu.Unlock()
+	case c.s != nil:
+		c.s.wmu.Lock()
+		c.s.subscribeFailed = true
+		c.s.wmu.Unlock()
+	}
+}
+
+func (e *Event[A, P]) subscribe(ctx context.Context, call *ToolCall, args A, opts ...SubscribeOption) (Subscription, error) {
 	var o subscribeOptions
 	for _, f := range opts {
 		if f != nil {
@@ -600,7 +767,7 @@ func (e *Event[A, P]) Subscribe(ctx context.Context, call *ToolCall, args A, opt
 	}
 	known := e.t.knownJSON(argsJSON)
 	wire := call.wire()
-	if call.Native {
+	if call.Native && !call.pushWoken {
 		sub, err := e.subscribeNative(ctx, call, s, wire, known, o)
 		if err == nil {
 			s.noteState(subKey(e.t.name, known), sub.State)
@@ -635,15 +802,28 @@ func (e *Event[A, P]) Subscribe(ctx context.Context, call *ToolCall, args A, opt
 			User    string `json:"user"`
 			Created bool   `json:"created"`
 		} `json:"event_subscription"`
-		Session string     `json:"session"`
-		Agent   Recognized `json:"agent"`
-		Pending string     `json:"pending"`
+		Session    string     `json:"session"`
+		Agent      Recognized `json:"agent"`
+		Pending    string     `json:"pending"`
+		NativeLine bool       `json:"native_line"`
+		// Wakes: the conversation's agent program has a wake path that
+		// runs now. An older core leaves it out: false.
+		Wakes bool `json:"wakes"`
+		// CallLimit: the program's per-call limit in seconds, if known.
+		// Raw, so anything but a number leaves it unknown.
+		CallLimit json.RawMessage `json:"call_limit"`
 	}
-	if err := e.app.eventsCall(ctx, "POST", "/api/apps/v1/event-subscriptions", body, &out); err != nil {
+	if err := e.app.inCall(ctx, e.app.subscribeBudget(), "POST", "/api/apps/v1/event-subscriptions", body, &out); err != nil {
 		return Subscription{}, err
 	}
 	if out.Pending != "" {
 		s.pending = out.Pending
+	}
+	if out.NativeLine && call.pushWoken && wire.EventsExt {
+		// The core chose native push for this caller: the block
+		// carries the native line (a tools-only event's with a voucher),
+		// and the bridged subscription stays as the fallback.
+		s.addNativeLine(e.t.name, known, o.nativeLine())
 	}
 	s.armed = true
 	call.setSession(out.Session)
@@ -660,6 +840,7 @@ func (e *Event[A, P]) Subscribe(ctx context.Context, call *ToolCall, args A, opt
 		s.created[i].ctx, s.created[i].value = context.WithoutCancel(ctx), o.context
 	}
 	s.noteState(subKey(e.t.name, known), state)
+	s.noteWakes(out.Wakes, callLimitOf(out.CallLimit))
 	user := es.User
 	if user == "" {
 		user = call.User
@@ -669,24 +850,15 @@ func (e *Event[A, P]) Subscribe(ctx context.Context, call *ToolCall, args A, opt
 
 // subscribeNative is Subscribe for a caller that subscribes itself: a
 // native line telling it what to subscribe to, once the event's own checks
-// pass for this caller (design §3), else unavailable, logged once per tool
+// pass for this caller, else unavailable, logged once per tool
 // and reason.
 func (e *Event[A, P]) subscribeNative(ctx context.Context, call *ToolCall, s *callScope, wire wireCall, args json.RawMessage, o subscribeOptions) (Subscription, error) {
-	if !e.t.open() && wire.AgentToken == "" && e.app.vouchersOffered(ctx) {
+	if !e.t.open() && wire.AgentToken == "" && e.app.vouchersOfferedBy(ctx, time.Now().Add(e.app.subscribeBudget())) {
 		// A tools-only event: while the core hands out subscribe vouchers,
 		// the line carries one, so the client subscribes with what the tool
-		// gave it, signed in or not (docs/subscribe-vouchers.md §7.1). Not
+		// gave it, signed in or not. Not
 		// for an app acting for its agent, which the core gives none.
-		line := nativeLine{Once: o.once, context: o.context, hasContext: o.context != nil}
-		if o.ttl > 0 {
-			v := o.ttl.Seconds()
-			line.TTL = &v
-		}
-		if o.replaySet {
-			v := o.replay.Seconds()
-			line.Replay = &v
-		}
-		s.addNativeLine(e.t.name, args, line)
+		s.addNativeLine(e.t.name, args, o.nativeLine())
 		return Subscription{State: SubscriptionNative, User: wire.User}, nil
 	}
 	reason := ""
@@ -761,7 +933,10 @@ func (e *Event[A, P]) Unsubscribe(ctx context.Context, call *ToolCall, args A) (
 	}
 	known := e.t.knownJSON(argsJSON)
 	wire := call.wire()
-	if call.Native {
+	if call.Native && !call.pushWoken {
+		// The result no longer offers the line, whatever the core ends.
+		s.dropNativeLine(e.t.name, known)
+		s.noteNativeEnded(subKey(e.t.name, known))
 		return e.app.endNative(ctx, wire.User, e.t.name, known)
 	}
 	var out struct {
@@ -770,7 +945,7 @@ func (e *Event[A, P]) Unsubscribe(ctx context.Context, call *ToolCall, args A) (
 		// the block says to call again with it.
 		Addition addition `json:"addition"`
 	}
-	err = e.app.eventsCall(ctx, "POST", "/api/apps/v1/event-subscriptions/unsubscribe",
+	err = e.app.inCall(ctx, e.app.subscribeBudget(), "POST", "/api/apps/v1/event-subscriptions/unsubscribe",
 		map[string]any{"call": wire, "name": e.t.name, "arguments": known}, &out)
 	if note := strings.TrimSpace(out.Addition.Text); err == nil && note != "" && !slices.Contains(s.notes, note) {
 		s.notes = append(s.notes, note)
@@ -782,12 +957,16 @@ func (e *Event[A, P]) Unsubscribe(ctx context.Context, call *ToolCall, args A) (
 }
 
 // endNative ends user's webhook subscriptions to event with these
-// arguments.
+// arguments, each request an in-call step.
 func (c *Client) endNative(ctx context.Context, user, name string, args json.RawMessage) (bool, error) {
 	if user == "" {
 		return false, nil
 	}
-	subs, err := c.EventSubscriptions(ctx, user)
+	var subs []EventSubscription
+	err := c.inCallBy(ctx, time.Now().Add(c.subscribeBudget()), func(ctx context.Context) (err error) {
+		subs, err = c.listEventSubscriptions(ctx, map[string]any{"user": user})
+		return err
+	})
 	if err != nil {
 		return false, err
 	}
@@ -796,7 +975,11 @@ func (c *Client) endNative(ctx context.Context, user, name string, args json.Raw
 		if sub.Event != name || sub.Destination != "webhook" || !sameJSON(sub.Arguments, args) {
 			continue
 		}
-		ok, err := c.endEventSubscription(ctx, map[string]any{"user": user, "id": sub.ID})
+		var ok bool
+		err := c.inCallBy(ctx, time.Now().Add(c.subscribeBudget()), func(ctx context.Context) (err error) {
+			ok, err = c.endEventSubscription(ctx, map[string]any{"user": user, "id": sub.ID})
+			return err
+		})
 		if err != nil {
 			return ended, err
 		}
@@ -822,6 +1005,19 @@ func sameJSON(a, b json.RawMessage) bool {
 // addNative adds a native line, once per event and arguments.
 func (s *callScope) addNative(name string, args json.RawMessage) {
 	s.addNativeLine(name, args, nativeLine{})
+}
+
+// dropNativeLine removes the call's native line for name and args (an
+// Unsubscribe in the call), so the result no longer offers it.
+func (s *callScope) dropNativeLine(name string, args json.RawMessage) {
+	key := subKey(name, args)
+	kept := s.native[:0]
+	for _, l := range s.native {
+		if subKey(l.Name, l.Arguments) != key {
+			kept = append(kept, l)
+		}
+	}
+	s.native = kept
 }
 
 // addNativeLine is addNative, with line's options.

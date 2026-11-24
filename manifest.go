@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 )
 
@@ -91,8 +92,10 @@ func (c *Client) PublishManifest(ctx context.Context, m Manifest) error {
 	if !c.Enabled() {
 		return errDisabled("PublishManifest")
 	}
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
+	if err := c.sendMu.lock(ctx); err != nil {
+		return err
+	}
+	defer c.sendMu.unlock()
 	// The generation before the body: an event defined in between is sent
 	// again later, never marked sent without being in it.
 	c.mu.Lock()
@@ -234,8 +237,23 @@ func (c *Client) ensureManifest(ctx context.Context) error {
 	if done {
 		return nil
 	}
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
+	if noRetries(ctx) {
+		// A tool call's step (inCallBy): the send is the client's shared
+		// work, so it runs detached, with the client's timeout and retries,
+		// and finishes even if the call stops waiting at its budget.
+		sent := make(chan error, 1)
+		go func() { sent <- c.ensureManifest(sharedContext{context.WithoutCancel(ctx)}) }()
+		select {
+		case err := <-sent:
+			return err
+		case <-ctx.Done():
+			return fmt.Errorf("wakeshift: the request to Wakeshift ended: %w", ctx.Err())
+		}
+	}
+	if err := c.sendMu.lock(ctx); err != nil {
+		return err // a tool call's budget passed while another send ran
+	}
+	defer c.sendMu.unlock()
 	c.mu.Lock()
 	done = c.sent && c.sentGen == c.gen
 	failed, ferr := c.ensures != seen, c.ensureErr
@@ -263,8 +281,10 @@ func (c *Client) ensureManifest(ctx context.Context) error {
 // finished since the emit went (seen: sendCount then). sendMu makes emits
 // that fail together send it once.
 func (c *Client) resendManifest(ctx context.Context, seen uint64) error {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
+	if err := c.sendMu.lock(ctx); err != nil {
+		return err
+	}
+	defer c.sendMu.unlock()
 	if c.sendCount() != seen {
 		return nil
 	}
@@ -298,6 +318,7 @@ func (c *Client) mergeManifest(ctx context.Context) error {
 	body := mergeBody{Description: m.Description, Agent: m.Agent, Events: m.Events, OthersCanWake: m.OthersCanWake, PreapproveTools: m.PreapproveTools}
 	var out manifestAnswer
 	if err := c.appCall(ctx, "POST", "/api/apps/v1/manifest/merge", body, &out); err != nil {
+		c.logManifestRefused(ctx, err)
 		return err
 	}
 	c.markSent(gen)
@@ -306,8 +327,21 @@ func (c *Client) mergeManifest(ctx context.Context) error {
 	return nil
 }
 
+// logManifestRefused logs manifest_refused when Wakeshift refused the
+// automatic send with a 4xx other than a refused key (401 and 403, which
+// key_refused covers): the app's events aren't served until they're fixed.
+// reason is Wakeshift's error code; the message is Wakeshift's own about the
+// app's event definitions (never a payload, a secret or the vendor's text).
+func (c *Client) logManifestRefused(ctx context.Context, err error) {
+	e, ok := err.(*APIError)
+	if !ok || e.Status < 400 || e.Status >= 500 || e.Status == http.StatusUnauthorized || e.Status == http.StatusForbidden {
+		return
+	}
+	c.logLimited(ctx, "manifest_refused", "Wakeshift refused this app's events: "+e.Message, slog.String("reason", string(e.Code)))
+}
+
 // subscribeVouchers is the core's feature: it hands out subscribe vouchers
-// for tools-only events to native callers (docs/subscribe-vouchers.md).
+// for tools-only events to native callers.
 const subscribeVouchers = "subscribe_vouchers"
 
 // noteFeatures keeps what a manifest answer says the core offers.

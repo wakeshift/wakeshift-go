@@ -34,7 +34,9 @@ func TestClaimName(t *testing.T) {
 		if c, ok := Claimed(h.Claim); !ok || c.ID != h.ID {
 			t.Errorf("%s: its claim %q names %q", h.ID, h.Claim, c.ID)
 		}
-		if h.Family != "" && (len(h.Clients) > 0 || h.Fingerprint != "" || len(h.UserAgents) > 0) {
+		// A family member is never recognized by itself, except by a client
+		// name only it sends, exactly (ChatGPT's Codex mode).
+		if h.Family != "" && (len(h.Clients) > 0 && !h.Exact || h.Fingerprint != "" || len(h.UserAgents) > 0) {
 			t.Errorf("%s: a family member is never recognized by itself", h.ID)
 		}
 	}
@@ -92,7 +94,7 @@ func TestArgDescriptions(t *testing.T) {
 	for _, f := range []string{"toolcall.ts", "tasks.ts"} {
 		b, err := os.ReadFile("../../sdk/typescript/src/" + f)
 		if errors.Is(err, fs.ErrNotExist) {
-			// The published connectors (opensource/export.sh) have no SDK; this
+			// The published connectors have no SDK; this
 			// repository always does, so the check runs here.
 			t.Skip("the TypeScript SDK isn't in this tree")
 		}
@@ -116,8 +118,8 @@ func TestForegroundNote(t *testing.T) {
 	grok, _ := Get("grok-bot")
 	url := "https://x.test/v1/stream/wait?link=a"
 	n := ForegroundNote(grok, "CI", url, true)
-	for _, w := range []string{"can't be woken by a command in the background", "in the foreground", "curl -sN '" + url + "'",
-		"you're blocked on that command", "interrupts the wait", `{"type":"hub.next","url":…}`, "with the url (and after=) you ran last", `{"type":"cursor","after":…}`,
+	for _, w := range []string{"can't be woken by a command in the background", "in the foreground", LinkStep(url), "run this command now and let it run: " + MuseLoop(url) + " .",
+		"you're blocked on that command", "interrupts the wait", "confirms them itself", "run the same command again", "run it again the same way",
 		`{"type":"hub.closed"}`, "printenv CURSOR_CONVERSATION_ID", "as conversation_id", "outside data, not from the user"} {
 		if !strings.Contains(n, w) {
 			t.Errorf("missing %q: %s", w, n)
@@ -132,8 +134,8 @@ func TestForegroundNote(t *testing.T) {
 }
 
 // pi is recognized by its client name and named by a claim (the harness
-// argument lists it), never by a "pi-…" variant of its name; until its
-// extension ships, it's told nothing will notify it.
+// argument lists it), never by a "pi-…" variant of its name, and offered
+// Wakeshift's extension.
 func TestPiRecognizedAndClaimed(t *testing.T) {
 	if h, via, ok := Recognize("pi", nil, "undici"); !ok || h.ID != "pi" || via != ByClient {
 		t.Fatalf("recognize: %v %v %v", h.ID, via, ok)
@@ -151,7 +153,7 @@ func TestPiRecognizedAndClaimed(t *testing.T) {
 		t.Fatal(ArgDescription())
 	}
 	h, _ := Get("pi")
-	if n := InstallNote(h, "https://app.wakeshift.ai"); n != CantWake("pi") {
+	if n := InstallNote(h, "https://app.wakeshift.ai"); !strings.Contains(n, "Install Wakeshift's extension for pi? It runs `curl -fsSL https://app.wakeshift.ai/install/pi.sh | sh`.") {
 		t.Fatalf("note: %s", n)
 	}
 }

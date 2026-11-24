@@ -2,7 +2,7 @@ package wakeshift
 
 // The context a subscribe voucher's redemption gets (Subscribed.Context).
 // A tool call that subscribes a native client to a tools-only event hands
-// it a voucher in the block (docs/subscribe-vouchers.md); the client
+// it a voucher in the block; the client
 // subscribes with it later, in another request. The value the tool passed
 // Subscribe (Context) is remembered here, in this process, until the
 // voucher is redeemed or expires, so OnSubscribe gets it then. Only the

@@ -22,6 +22,30 @@ func SetTimeLimits(d time.Duration) (restore func()) {
 	return func() { identifyTimeout, authorizeTimeout = pi, pa }
 }
 
+// SetBreaker sets the in-call breaker's threshold and cool-down, for the
+// external tests; the returned func restores them.
+func SetBreaker(threshold int, cooldown time.Duration) (restore func()) {
+	pt, pc := breakerThreshold, breakerCooldown
+	breakerThreshold, breakerCooldown = threshold, cooldown
+	return func() { breakerThreshold, breakerCooldown = pt, pc }
+}
+
+// SetRetryPauses sets the pauses before retries, for the external tests;
+// the returned func restores them.
+func SetRetryPauses(d ...time.Duration) (restore func()) {
+	prev := retryPauses
+	retryPauses = d
+	return func() { retryPauses = prev }
+}
+
+// SetClientRequestTimeout sets how long a client request's form is waited
+// for, for the external tests; the returned func restores it.
+func SetClientRequestTimeout(d time.Duration) (restore func()) {
+	prev := clientRequestBounds.timeout
+	clientRequestBounds.timeout = d
+	return func() { clientRequestBounds.timeout = prev }
+}
+
 // SetClock sets c's clock, for the external tests.
 func SetClock(c *Client, now func() time.Time) { c.now = now }
 

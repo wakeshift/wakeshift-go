@@ -67,7 +67,7 @@ func TestVendorDiscoverKeepsEventsCapability(t *testing.T) {
 // present.
 // The events capability is advertised with any event, tools-only ones
 // included: a native client subscribes to those with the subscribe voucher
-// a tool handed it (docs/subscribe-vouchers.md §4.3).
+// a tool handed it.
 func TestEventsCapabilityWithAnyEvent(t *testing.T) {
 	for _, open := range []bool{false, true} {
 		wake := testClient(t, "https://core.example", wakeshift.WithLogger(slog.New(slog.DiscardHandler)))

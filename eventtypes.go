@@ -185,7 +185,10 @@ type eventType struct {
 	personal, public         bool
 	deleteOnDelivery         bool
 	argNames                 []string // in name order
-	authorize                func(ctx context.Context, s Subscriber, args json.RawMessage) (bool, error)
+	// paramHeaders are the arguments its x-mcp-header annotations mirror
+	// into Mcp-Param headers (paramHeadersOf).
+	paramHeaders []paramHeader
+	authorize    func(ctx context.Context, s Subscriber, args json.RawMessage) (bool, error)
 	// onSubscribe is EventDef.OnSubscribe, its arguments decoded.
 	onSubscribe func(ctx context.Context, args json.RawMessage, info subscribedInfo) error
 }
@@ -232,6 +235,12 @@ func DefineEvent[A, P any](wake *Client, name string, def EventDef[A, P]) (*Even
 	}
 	t := &eventType{name: name, title: def.Title, description: def.Description, args: args, payload: payload,
 		topic: def.Topic, filter: def.Filter, personal: def.Personal, public: def.Public, deleteOnDelivery: def.DeleteOnDelivery}
+	// An invalid x-mcp-header makes a spec client drop the event type (SEP-3415).
+	var argsTree any
+	json.Unmarshal(args, &argsTree)
+	if t.paramHeaders, err = paramHeadersOf(argsTree); err != nil {
+		return nil, usage(CodeConfig, "event %s: arguments: %v", name, err)
+	}
 	var props schemaProps
 	json.Unmarshal(args, &props)
 	for n := range props.Properties {
@@ -239,7 +248,7 @@ func DefineEvent[A, P any](wake *Client, name string, def EventDef[A, P]) (*Even
 	}
 	slices.Sort(t.argNames)
 	if slices.Contains(t.argNames, voucherArg) {
-		// A native client writes a subscribe voucher there (docs/subscribe-vouchers.md §4.4).
+		// A native client writes a subscribe voucher there.
 		return nil, usage(CodeConfig, "event %s: %s is Wakeshift's: a native client passes a subscribe voucher in it. Name the argument something else", name, voucherArg)
 	}
 	if t.topic == "" {
@@ -378,7 +387,7 @@ func jsNumbers(v any) any {
 	return v
 }
 
-// authorizeTimeout bounds Authorize and Identify (design §2.8, §2.9).
+// authorizeTimeout bounds Authorize and Identify.
 var authorizeTimeout = timeLimit
 
 // authorized runs t's Authorize for s and args: false if it refuses,
@@ -398,7 +407,7 @@ func (c *Client) authorized(ctx context.Context, t *eventType, s Subscriber, arg
 }
 
 // voucherArg is the event argument a native client passes a subscribe
-// voucher in (docs/subscribe-vouchers.md §4.4): reserved, and taken out
+// voucher in: reserved, and taken out
 // before anything reads the arguments.
 const voucherArg = "wakeshift_voucher"
 
@@ -417,15 +426,16 @@ func takeVoucher(args map[string]any) (map[string]any, string) {
 }
 
 // definition is the event type as events/list describes it.
-func (t *eventType) definition() map[string]any {
-	return t.definitionFor(nil)
+func (t *eventType) definition(push bool) map[string]any {
+	return t.definitionFor(nil, push)
 }
 
 // definitionFor is definition, with voucherApp (a tools-only event listed
 // to a native request while the core hands out subscribe vouchers): its
 // arguments gain the required wakeshift_voucher, described with the app's
-// name ("" for "this app").
-func (t *eventType) definitionFor(voucherApp *string) map[string]any {
+// name ("" for "this app"). push: push is served for this request, so
+// delivery lists it, last.
+func (t *eventType) definitionFor(voucherApp *string, push bool) map[string]any {
 	input := json.RawMessage(t.args)
 	if voucherApp != nil {
 		var schema map[string]any
@@ -457,11 +467,15 @@ func (t *eventType) definitionFor(voucherApp *string) map[string]any {
 		schema["required"] = required
 		input, _ = json.Marshal(schema)
 	}
-	delivery := event.Delivery
+	delivery := slices.Clone(event.Delivery)
 	if !t.open() {
 		// A tools-only event is never polled (events/poll is refused,
-		// voucher or not): a webhook, with a voucher, is the only way.
+		// voucher or not): a webhook or a push stream, with a voucher, is
+		// the only way.
 		delivery = []string{"webhook"}
+	}
+	if push {
+		delivery = append(delivery, pushDelivery)
 	}
 	d := map[string]any{"name": t.name, "description": t.description, "delivery": delivery,
 		"inputSchema": input, "payloadSchema": json.RawMessage(t.payload)}

@@ -26,8 +26,7 @@ var goldenDir = sharedGoldenDir()
 
 // sharedGoldenDir is where the golden files the three SDKs share are:
 // beside the TypeScript SDK's tests in Wakeshift's repository, or
-// testdata/golden in the published Go SDK, where opensource/export.sh copies
-// them.
+// testdata/golden in the published Go SDK, where publishing copies them.
 func sharedGoldenDir() string {
 	if here := filepath.Join("..", "..", "sdk", "typescript", "test"); exists(here) {
 		return here

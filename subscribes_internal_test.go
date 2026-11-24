@@ -10,7 +10,7 @@ import (
 
 // The shared fixture: the sentence tools/list adds to a tool that
 // subscribes, the same in every SDK (subscribes.json compact_cases; the
-// bench kept the wording as it was, and it's added always).
+// compact tools/list keeps the wording as it was, and it's added always).
 func TestSubscribesGolden(t *testing.T) {
 	if _, err := os.Stat(goldenDir); err != nil {
 		t.Skip("no shared golden files here")

@@ -1,6 +1,6 @@
 package wakeshift
 
-// No secret is ever printed (design §4): every type that holds one redacts
+// No secret is ever printed: every type that holds one redacts
 // itself in every printing and logging path Go has, and RedactSecrets
 // cleans text the SDK can't reach.
 

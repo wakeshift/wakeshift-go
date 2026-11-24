@@ -1,6 +1,7 @@
 package harnesses
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -67,16 +68,20 @@ func TestAgentID(t *testing.T) {
 		if h.Unsure != "" {
 			continue
 		}
+		want := h.ID
+		if h.Family != "" { // a variant's agent is its family's (ChatGPT's Codex mode)
+			want = h.Family
+		}
 		for _, c := range h.Clients {
-			if got := AgentID(c); got != h.ID {
+			if got := AgentID(c); got != want {
 				t.Errorf("%s's client %q: %q", h.ID, c, got)
 			}
 		}
 	}
 }
 
-// Each harness is found by the clientInfo name it really sends (verified
-// against the binaries), and only by that.
+// Each harness is found by the clientInfo name it really sends (as
+// observed), and only by that.
 // A stateless server sees the name a client registered with; with a tag in
 // parentheses, or the harness's own name, it's still that harness exactly.
 func TestExactClient(t *testing.T) {
@@ -123,11 +128,11 @@ func TestForClient(t *testing.T) {
 		"goose-cli":             "goose",
 		"Visual Studio Code":    "vscode",
 		"openai-mcp":            "chatgpt",       // from OpenAI's developer forum, not captured
-		"capy":                  "capy",          // captured from Capy's backend, November 5, 2026
-		"muse-custom-connector": "muse",          // captured from Meta's servers, November 5, 2026
+		"capy":                  "capy",          // observed from Capy's backend
+		"muse-custom-connector": "muse",          // observed from Meta's servers
 		"claude-ai":             "claude-cowork", // Claude's apps' connectors: Cowork's, and claude.ai chat's (Shared)
 		"Claude-AI":             "claude-cowork",
-		// A local MCP server in a Cowork plugin (the spike's probe, November 7, 2026).
+		// A local MCP server in a Cowork plugin (observed).
 		"local-agent-mode-plugin:wakeshift-cowork-probe:wakeshift-probe": "claude-cowork",
 		"LOCAL-AGENT-MODE-PLUGIN:p:s":                                    "claude-cowork",
 	} {
@@ -175,10 +180,10 @@ func TestInstallNote(t *testing.T) {
 	h = WithClient(h, newClaudeUA, "", "")
 	n := InstallNote(h, "https://app.wakeshift.ai/")
 	for _, want := range []string{"Ask them one question with your AskUserQuestion tool",
-		`"Notify me in every session" (description: runs ` + "`claude plugin install wakeshift --marketplace wakeshift/agent-plugins --config issuer=https://app.wakeshift.ai` (Wakeshift's plugin for Claude Code), which installs Wakeshift's plugin for Claude Code from github.com/wakeshift/agent-plugins with Claude Code's own plugin installer; its hooks fetch Wakeshift's connector into ~/.wakeshift/bin, checking its SHA-256, and it adds one permission rule to ~/.claude/settings.json so Claude Code runs Wakeshift's wait command (~/.wakeshift/bin/wakeshift wait) without asking each time)",
+		`"Notify me in every session" (description: runs ` + "`claude plugin install wakeshift --marketplace wakeshift/agent-plugins` (Wakeshift's plugin for Claude Code), which installs Wakeshift's plugin for Claude Code from github.com/wakeshift/agent-plugins with Claude Code's own plugin installer; its hooks fetch Wakeshift's connector into ~/.wakeshift/bin, checking its SHA-256, and it adds one permission rule to ~/.claude/settings.json so Claude Code runs Wakeshift's wait command (~/.wakeshift/bin/wakeshift wait) without asking each time)",
 		`"Notify me while this session is open" (description: starts a background listener (the Monitor) for this session only; nothing is installed)`,
 		`Only if they pick "Notify me in every session", run`, "if running it is refused (auto mode's classifier or a permission denial)",
-		"type themselves, as it is: `! claude plugin install wakeshift --marketplace wakeshift/agent-plugins --config issuer=https://app.wakeshift.ai`",
+		"type themselves, as it is: `! claude plugin install wakeshift --marketplace wakeshift/agent-plugins`",
 		"don't start the Monitor", "type /reload-plugins here", "send any message here", "connects this conversation by itself once it's loaded"} {
 		if !strings.Contains(n, want) {
 			t.Fatalf("missing %q in %s", want, n)
@@ -203,7 +208,7 @@ func TestInstallNote(t *testing.T) {
 		if name == "subscribe" || name == "upgrade" {
 			wants = []string{"Ask them one question with your AskUserQuestion tool", `"` + AskEvery + "\" (description: runs `claude plugin install", `"` + AskSession + `"`, `"` + AskNone + `"`, `Only if they pick "` + AskEvery + `"`}
 		}
-		for _, want := range append(wants, "type themselves, as it is: `! claude plugin install wakeshift --marketplace wakeshift/agent-plugins --config issuer=https://app.wakeshift.ai`") {
+		for _, want := range append(wants, "type themselves, as it is: `! claude plugin install wakeshift --marketplace wakeshift/agent-plugins`") {
 			if !strings.Contains(note, want) {
 				t.Fatalf("%s: missing %q in %s", name, want, note)
 			}
@@ -282,15 +287,26 @@ func TestInstallNote(t *testing.T) {
 // SessionStart hook runs when the resumed thread's first turn starts) and
 // Hermes's chat (its plugin can't tell which chat it is until a turn).
 // Claude Code's SessionStart hook, and opencode's and OpenClaw's plugins at
-// load, reconnect it.
+// load, reconnect it. opencode and pi say it too (issue #1106): the session
+// that installed them connects from the next result of the app's tools,
+// whose call their plugin names the session on, and a user who isn't told
+// to send a message waits for a turn that never starts; the message itself
+// asks for no call.
 func TestTrustNoteAsksOnlyWhereNeeded(t *testing.T) {
 	restart := map[string]bool{"codex": true, "cursor": true, "copilot": true, "antigravity": true, "hermes": true}
 	message := map[string]bool{"cursor": true, "copilot": true, "antigravity": true}
+	// opencode and pi connect the installing conversation from the next
+	// result of the app's tools, so a message alone isn't enough: the user
+	// asks for something that uses the app.
+	usesApp := map[string]bool{"opencode": true, "pi": true}
 	for _, h := range All() {
 		if !h.Installable {
 			continue
 		}
 		if strings.Contains(h.Resume, "send any") != message[h.ID] {
+			t.Errorf("%s: Resume %q", h.ID, h.Resume)
+		}
+		if strings.Contains(h.Resume, "something that uses the app") != usesApp[h.ID] {
 			t.Errorf("%s: Resume %q", h.ID, h.Resume)
 		}
 		if strings.Contains(h.Resume, "connect") && h.ZeroInstall == Background {
@@ -370,7 +386,7 @@ func TestNotesFromTheInstallLoop(t *testing.T) {
 		}
 	}
 	claude, _ := Get("claude-code")
-	if n := PluginFirstNote(claude, "https://x.test", "App", false, "FALLBACK."); strings.Contains(n, "this tool again") || !strings.Contains(n, `first wake starts with "Wakeshift: connected"`) {
+	if n := PluginFirstNote(claude, "https://x.test", "App", false, "FALLBACK."); strings.Contains(n, "this tool again") || !strings.Contains(n, `first wake confirms it to you with a note starting "Wakeshift: connected"`) {
 		t.Errorf("claude code: %s", n)
 	}
 	for _, id := range []string{"cursor", "antigravity"} {
@@ -398,11 +414,18 @@ func TestRepeatNote(t *testing.T) {
 // A harness Wakeshift can't wake is told it's Wakeshift that can't, not the
 // app, in one neutral line that asks for nothing.
 func TestCantWake(t *testing.T) {
-	if n := CantWake(""); n != "Wakeshift can't wake this agent, so nothing will notify you here when something arrives." {
+	if n := CantWake(""); n != "Wakeshift can't wake this agent, so nothing will notify you here when something arrives. Tell the user so plainly, and don't say you're watching or that you'll let them know." {
 		t.Fatal(n)
 	}
 	if g, _ := Get("goose"); !strings.Contains(InstallNote(g, "https://x.test"), "Wakeshift can't wake Goose conversations,") {
 		t.Fatal(InstallNote(g, "https://x.test"))
+	}
+	// Every can't-wake note, named or not, tells the agent not to claim
+	// it's watching.
+	for _, n := range []string{CantWake(""), CantWake("Goose")} {
+		if !strings.HasSuffix(n, " Tell the user so plainly, and don't say you're watching or that you'll let them know.") {
+			t.Fatal(n)
+		}
 	}
 }
 
@@ -505,7 +528,7 @@ func TestUnsure(t *testing.T) {
 func TestHermesOffer(t *testing.T) {
 	h, _ := Get("hermes")
 	// It also turns on allow_gateway_injection (every Hermes chat needs it), as its Changes say.
-	if !strings.Contains(h.Changes, "allow_gateway_injection") || !strings.Contains(h.Changes, "wakes no Hermes chat, through the API server or `hermes chat`") || strings.Contains(h.Changes, "0.22.3") {
+	if !strings.Contains(h.Changes, "allow_gateway_injection") || !strings.Contains(h.Changes, "wakes no Hermes chat, through the API server, `hermes chat` or a Telegram or Discord direct message") || strings.Contains(h.Changes, "0.22.3") {
 		t.Errorf("Changes: %s", h.Changes)
 	}
 	const install = "hermes plugins install wakeshift/hermes-plugin --enable && hermes config set plugins.entries.wakeshift.allow_gateway_injection true"
@@ -661,7 +684,7 @@ func TestConversationAndCall(t *testing.T) {
 
 // Recognize: a stated client name wins; without one, a _meta key only one
 // harness sends; without that, a User-Agent product token only one sends
-// (the User-Agents captured from the real binaries).
+// (the User-Agents as observed from each harness).
 func TestRecognize(t *testing.T) {
 	codex := map[string]any{"x-codex-turn-metadata": map[string]any{"thread_id": "t1"}}
 	claude := map[string]any{"claudecode/toolUseId": "toolu_1"}
@@ -683,11 +706,11 @@ func TestRecognize(t *testing.T) {
 		{"", map[string]any{"wakeshift/conversation": "1b47"}, "", "copilot", ByMeta},
 		{"my-client", claude, "", "claude-code", ByMeta}, // a client name that names no harness
 		{"", claude, "opencode/1.18.7", "claude-code", ByMeta},
-		// User-Agents as the binaries send them.
+		// User-Agents as the harnesses send them.
 		{"", nil, "claude-code/2.1.280 (sdk-cli)", "claude-code", ByUserAgent},
 		{"", nil, "codex-mcp-client/0.163.0", "codex", ByUserAgent},
 		// ChatGPT's Work chats call tools and events/* through Codex
-		// (the voucher probe, November 5, 2026): the product is still
+		// (observed): the product is still
 		// openai-mcp, and the comment names Codex. It's ChatGPT, not Codex.
 		{"", nil, "openai-mcp/1.0.0 (Codex)", "chatgpt", ByUserAgent},
 		{"", nil, "openai-mcp/1.0.0", "chatgpt", ByUserAgent},
@@ -701,11 +724,34 @@ func TestRecognize(t *testing.T) {
 		{"openai-mcp", nil, "openai-mcp/1.0.0", "chatgpt", ByClient},
 		{"", map[string]any{"openai/session": "v1/abc"}, "", "chatgpt", ByMeta},
 		{"", nil, "openai-mcp/1.0.0", "chatgpt", ByUserAgent},
-		// Capy's backend, as a probe server captured it (November 5, 2026).
+		// ChatGPT's desktop app (Codex mode), as observed: its client name with its capabilities (both
+		// the skybridge mime type and openai/form). A variant of ChatGPT,
+		// never Codex.
+		{"openai-mcp (Codex)", withCaps(map[string]any{"openai/session": "v1/abc", "sessionId": "6f1d"}, desktopCaps), "openai-mcp/1.0.0 (Codex)", "chatgpt-codex", ByClient},
+		{"OpenAI-MCP (codex)", withCaps(nil, desktopCaps), "", "chatgpt-codex", ByClient},
+		{"openai-mcp (Codex mode)", withCaps(nil, desktopCaps), "", "chatgpt", ByClient},
+		{"openai-mcp", withCaps(nil, desktopCaps), "", "chatgpt", ByClient},
+		{"", map[string]any{"sessionId": "6f1d"}, "", "", ""},
+		// A Work chat on the web: the same name, User-Agent and _meta keys,
+		// but neither the skybridge mime type nor openai/form. ChatGPT. So is
+		// anything short of both, missing or malformed capabilities included.
+		{"openai-mcp (Codex)", withCaps(map[string]any{"openai/session": "v1/abc", "traceparent": "00-x"}, webCaps), "openai-mcp/1.0.0 (Codex)", "chatgpt", ByClient},
+		{"openai-mcp (Codex)", withCaps(nil, desktopWithout("openai/form")), "", "chatgpt", ByClient},
+		{"openai-mcp (Codex)", withCaps(nil, desktopWithout("io.modelcontextprotocol/ui")), "", "chatgpt", ByClient},
+		// The desktop app's regular chat (not Codex mode): the classic
+		// connector client, ChatGPT as before.
+		{"openai-mcp", withCaps(map[string]any{"openai/userAgent": "Codex Desktop/26.1103.60933 (Mac OS; arm64)", "openai/session": "v1/abc", "timezone": "UTC"},
+			mustJSON(`{"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]}}}`)), "openai-mcp/1.0.0", "chatgpt", ByClient},
+		{"openai-mcp (Codex)", nil, "", "chatgpt", ByClient},
+		{"openai-mcp (Codex)", map[string]any{"io.modelcontextprotocol/clientCapabilities": "x"}, "", "chatgpt", ByClient},
+		{"openai-mcp (Codex)", map[string]any{"io.modelcontextprotocol/clientCapabilities": map[string]any{"extensions": []any{1}}}, "", "chatgpt", ByClient},
+		{"openai-mcp (Codex)", map[string]any{"io.modelcontextprotocol/clientCapabilities": map[string]any{"extensions": map[string]any{
+			"openai/form": map[string]any{}, "io.modelcontextprotocol/ui": map[string]any{"mimeTypes": "text/html+skybridge"}}}}, "", "chatgpt", ByClient},
+		// Capy's backend, as observed.
 		{"capy", nil, "capy", "capy", ByClient},
 		{"", nil, "capy", "capy", ByUserAgent},
 		{"", map[string]any{}, "capybara/1", "", ""},
-		// Muse's connector (November 5, 2026): its client name alone. Its
+		// Muse's connector, as observed: its client name alone. Its
 		// User-Agent is Python's default, and other "muse-…" clients aren't
 		// it.
 		{"muse-custom-connector", nil, "Python-urllib/3.12", "muse", ByClient},
@@ -760,7 +806,7 @@ func TestRecognize(t *testing.T) {
 	}
 }
 
-// Asked once per conversation (vendor bench, November 6, 2026): what a
+// Asked once per conversation: what a
 // later subscribing call gets while nothing wakes the conversation is one
 // short note that points back to the earlier ask: no install command, no
 // question, and it says not to ask again after a no.
@@ -789,5 +835,98 @@ func TestAskedNotes(t *testing.T) {
 	}
 	if strings.Contains(n, "claude plugin install") || strings.Contains(n, "AskUserQuestion") || len(n) > 900 {
 		t.Errorf("PluginAskedNote repeats the ask: %s", n)
+	}
+}
+
+// ChatGPT's Codex mode's foreground command waits one round of 90
+// seconds, with curl's limit inside ChatGPT's 120-second cutoff, and never
+// asks for say=command (whose note would print a command holding the
+// link); Grok Bot's is MuseLoop, unchanged.
+func TestForegroundLoop(t *testing.T) {
+	codex, _ := Get("chatgpt-codex")
+	grok, _ := Get("grok-bot")
+	const u = "https://core.test/v1/stream/wait?link=wsl_abc"
+	if got := ForegroundLoop(grok, u); got != MuseLoop(u) {
+		t.Errorf("grok-bot: %s", got)
+	}
+	cmd := ForegroundLoop(codex, u)
+	if !strings.Contains(cmd, `u="$b&timeout=90s"; c=; s=$(date +%s); for i in 1 2; do if r=$(curl -s -m 100 "$u"); then `) || strings.Contains(cmd, "say=") || strings.Contains(cmd, "while ") ||
+		strings.Contains(cmd, "wsl_abc") || !strings.Contains(cmd, `"type":"hub.restart"`) || !strings.Contains(cmd, linkSave) ||
+		!strings.Contains(cmd, `"reason":"unreachable"`) {
+		t.Errorf("chatgpt-codex: %s", cmd)
+	}
+	if n := ForegroundSeconds(codex); n <= 0 || n >= 100 {
+		t.Fatalf("chatgpt-codex waits %ds: not inside its 120-second cutoff with room", n)
+	}
+}
+
+// The capabilities ChatGPT's desktop app and a Work chat on the web sent
+// on tools/call (observed), as JSON.
+const (
+	desktopCapsJSON = `{"experimental":{"openai/visibility":{"enabled":true}},"elicitation":{"form":{},"url":{}},"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app","text/html+skybridge"]},"openai/elicitation":{"form":{},"userVerification":{}},"openai/form":{}}}`
+	webCapsJSON     = `{"experimental":{"openai/visibility":{"enabled":true}},"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]},"openai/elicitation":{"userVerification":{}}}}`
+)
+
+var desktopCaps, webCaps = mustJSON(desktopCapsJSON), mustJSON(webCapsJSON)
+
+func mustJSON(s string) map[string]any {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		panic(err)
+	}
+	return m
+}
+
+// withCaps is meta with caps as its clientCapabilities.
+func withCaps(meta, caps map[string]any) map[string]any {
+	out := map[string]any{"io.modelcontextprotocol/clientCapabilities": caps}
+	for k, v := range meta {
+		out[k] = v
+	}
+	return out
+}
+
+// desktopWithout is the desktop app's capabilities (a fresh copy) without
+// one of its extensions.
+func desktopWithout(drop string) map[string]any {
+	c := mustJSON(desktopCapsJSON)
+	delete(c["extensions"].(map[string]any), drop)
+	return c
+}
+
+// ChatGPTDesktop: both the skybridge mime type and openai/form, from the
+// desktop app's client name; never the web's capabilities.
+func TestChatGPTDesktop(t *testing.T) {
+	if !ChatGPTDesktop("openai-mcp (Codex)", withCaps(nil, desktopCaps)) {
+		t.Fatal("the desktop app")
+	}
+	if ChatGPTDesktop("openai-mcp (Codex)", withCaps(nil, webCaps)) {
+		t.Fatal("a Work chat on the web")
+	}
+	if ChatGPTDesktop("openai-mcp", withCaps(nil, desktopCaps)) || ChatGPTDesktop("codex-mcp-client", withCaps(nil, desktopCaps)) {
+		t.Fatal("another client name")
+	}
+	// The desktop app's regular chat (observed): ChatGPT, not native; the web's chats aren't it.
+	regular := withCaps(map[string]any{"openai/userAgent": "Codex Desktop/26.1103.60933 (Mac OS; arm64)", "openai/session": "v1/abc", "openai/locale": "en-US", "timezone": "UTC", "timezone_offset_minutes": 0},
+		mustJSON(`{"experimental":{"openai/visibility":{"enabled":true}},"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]}}}`))
+	if !ChatGPTDesktopChat("openai-mcp", regular) || !ChatGPTNotNative("openai-mcp", regular) || ChatGPTDesktop("openai-mcp", regular) {
+		t.Fatal("the desktop app's regular chat")
+	}
+	if h, _, _ := Recognize("openai-mcp", regular, "openai-mcp/1.0.0"); h.ID != "chatgpt" {
+		t.Fatalf("the desktop app's regular chat is %s", h.ID)
+	}
+	for name, c := range map[string]struct {
+		client string
+		meta   map[string]any
+	}{
+		"web Work chat":         {"openai-mcp (Codex)", withCaps(map[string]any{"traceparent": "00-x"}, webCaps)},
+		"another userAgent":     {"openai-mcp", map[string]any{"openai/userAgent": "Mozilla/5.0"}},
+		"no userAgent":          {"openai-mcp", map[string]any{"openai/session": "v1/abc"}},
+		"Codex mode's name":     {"openai-mcp (Codex)", map[string]any{"openai/userAgent": "Codex Desktop/26.1103.60933 (Mac OS; arm64)"}},
+		"a malformed userAgent": {"openai-mcp", map[string]any{"openai/userAgent": 7}},
+	} {
+		if ChatGPTDesktopChat(c.client, c.meta) || ChatGPTNotNative(c.client, c.meta) {
+			t.Errorf("%s: taken for the desktop app", name)
+		}
 	}
 }

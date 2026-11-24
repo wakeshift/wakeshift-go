@@ -7,6 +7,7 @@ import (
 	"flag"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -35,6 +36,7 @@ func goldenTexts() map[string]string {
 		"*|NoMonitorNote":         NoMonitorNote(url, false),
 		"*|NoMonitorNote.brief":   NoMonitorNote(url, true),
 		"*|CursorCloudNote":       CursorCloudNote(),
+		"*|CodexAppsNote":         CodexAppsNote("CI"),
 		"*|UntilLoop":             UntilLoop(url, true),
 		"*|UntilLoop.nohooks":     UntilLoop(url, false),
 		"*|SessionDescription":    SessionDescription,
@@ -60,11 +62,19 @@ func goldenTexts() map[string]string {
 			out[k("KitFor")] = KitFor(h, base)
 		}
 		k := func(what string) string { return h.ID + "|" + what }
-		out[k("BackgroundNote")] = BackgroundNote(h, "CI", url, false)
-		out[k("BackgroundNote.ask")] = BackgroundNote(h, "CI", url, true)
-		out[k("BackgroundAgainNote")] = BackgroundAgainNote(h, "CI", url, false, false)
-		out[k("BackgroundAgainNote.hooks")] = BackgroundAgainNote(h, "CI", url, true, true)
-		out[k("BackgroundRunningNote")] = BackgroundRunningNote(h, "CI", url)
+		out[k("BackgroundNote")] = BackgroundNote(h, "CI", url, Claim{}, false)
+		out[k("BackgroundNote.ask")] = BackgroundNote(h, "CI", url, Claim{}, true)
+		out[k("BackgroundAgainNote")] = BackgroundAgainNote(h, "CI", url, Claim{}, false, false)
+		out[k("BackgroundAgainNote.hooks")] = BackgroundAgainNote(h, "CI", url, Claim{}, true, true)
+		out[k("BackgroundRunningNote")] = BackgroundRunningNote(h, "CI", url, Claim{})
+		if h.ID == "cursor" { // what Cursor is served: its command claims its link (#1152)
+			c := Claim{URL: "https://core.test/v1/stream/claim", Token: "wso_00000000-0000-0000-0000-000000000000_CODE"}
+			out[k("BackgroundNote.claim")] = BackgroundNote(h, "CI", url, c, false)
+			out[k("BackgroundNote.claim.ask")] = BackgroundNote(h, "CI", url, c, true)
+			out[k("BackgroundAgainNote.claim")] = BackgroundAgainNote(h, "CI", url, c, false, false)
+			out[k("BackgroundAgainNote.claim.hooks")] = BackgroundAgainNote(h, "CI", url, c, true, true)
+			out[k("BackgroundRunningNote.claim")] = BackgroundRunningNote(h, "CI", url, c)
+		}
 		out[k("ForegroundNote")] = ForegroundNote(h, "CI", url, true)
 		out[k("UninstallNote")] = UninstallNote(h)
 		out[k("TrustNote")] = TrustNote(h)
@@ -114,6 +124,16 @@ func TestTextsGolden(t *testing.T) {
 			t.Errorf("%s: gone", k)
 		} else if g != want[k] {
 			t.Errorf("%s changed; it's now: %s", k, texts[k])
+		}
+	}
+}
+
+// No text an agent is given, and may relay, names an app by its internal
+// ID ("app/try"): apps are named by their display names.
+func TestTextsNameNoAppIDs(t *testing.T) {
+	for k, v := range goldenTexts() {
+		if strings.Contains(v, "app/") {
+			t.Errorf("%s names an app ID: %s", k, v)
 		}
 	}
 }

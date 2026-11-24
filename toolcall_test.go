@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -31,17 +32,21 @@ const testTrailer = "(For Wakeshift's hook on this computer, not for you: wakesh
 
 // wakeCore answers the app API's calls the wrapper makes, and records them.
 type wakeCore struct {
-	mu          sync.Mutex
-	calls       []wakeCoreCall
-	subs        int
-	seen        map[string]bool
-	addition    map[string]any // /calls/addition's answer
-	unsubscribe map[string]any // /event-subscriptions/unsubscribe's, if set
-	fail        map[string]bool
-	broken      map[string]string // a path that hangs ("hang"), drops the connection ("unreachable") or answers 401 ("401")
-	native      []wakeshift.EventSubscription
-	appName     string        // GET /app's name ("" answers 404)
-	appDelay    time.Duration // how long GET /app takes (or until the caller gives up)
+	mu            sync.Mutex
+	calls         []wakeCoreCall
+	subs          int
+	seen          map[string]bool
+	addition      map[string]any // /calls/addition's answer
+	unsubscribe   map[string]any // /event-subscriptions/unsubscribe's, if set
+	fail          map[string]bool
+	broken        map[string]string // a path that hangs ("hang"), drops the connection ("unreachable"), answers 400, 401 or 403 ("400"…), or the load balancer's HTML 500 ("refused")
+	native        []wakeshift.EventSubscription
+	appName       string        // GET /app's name ("" answers 404)
+	appDelay      time.Duration // how long GET /app takes (or until the caller gives up)
+	manifestDelay time.Duration // how long the manifest's merge takes
+	wakes         any           // /event-subscriptions' wakes (nil: left out, as an older core does)
+	callLimit     any           // /event-subscriptions' call_limit (nil: left out, a limit that isn't known)
+	request       any           // a client request /calls/addition adds when the call offers elicit.form (clientrequests_test.go)
 }
 
 type wakeCoreCall struct {
@@ -67,6 +72,16 @@ func (f *wakeCore) handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.mu.Lock()
+	mdelay := f.manifestDelay
+	f.mu.Unlock()
+	if path == "/manifest/merge" && mdelay > 0 {
+		select {
+		case <-time.After(mdelay):
+		case <-r.Context().Done():
+			return
+		}
+	}
+	f.mu.Lock()
 	broken := f.broken[path]
 	if broken != "" {
 		f.calls = append(f.calls, wakeCoreCall{Path: path, Body: body})
@@ -84,6 +99,16 @@ func (f *wakeCore) handler(w http.ResponseWriter, r *http.Request) {
 	case "401":
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "unauthenticated", "message": "key revoked"}})
+		return
+	case "400", "403":
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(map[string]int{"400": http.StatusBadRequest, "403": http.StatusForbidden}[broken])
+		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "bad_request", "message": "no"}})
+		return
+	case "refused": // the load balancer's HTML 500 page: never reached Wakeshift
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, "<html><title>500 Server Error</title><h1>Error: Server Error</h1></html>")
 		return
 	}
 	f.mu.Lock()
@@ -121,16 +146,29 @@ func (f *wakeCore) handler(w http.ResponseWriter, r *http.Request) {
 		if pending == "" {
 			pending = "pa_first"
 		}
-		reply(map[string]any{"event_subscription": map[string]any{"id": fmt.Sprintf("sub-%d", f.subs), "user": call["user"], "created": created},
-			"session": "wsc_s1", "agent": map[string]any{"harness": "claude-code", "via": "user_agent"}, "pending": pending})
+		out := map[string]any{"event_subscription": map[string]any{"id": fmt.Sprintf("sub-%d", f.subs), "user": call["user"], "created": created},
+			"session": "wsc_s1", "agent": map[string]any{"harness": "claude-code", "via": "user_agent"}, "pending": pending}
+		if f.wakes != nil {
+			out["wakes"] = f.wakes
+		}
+		if f.callLimit != nil {
+			out["call_limit"] = f.callLimit
+		}
+		reply(out)
 	case "/calls/session":
 		reply(map[string]any{"session": "wsc_resolved", "pending": "pa_session", "agent": map[string]any{"harness": "codex", "via": "meta"}})
 	case "/calls/addition":
-		if f.addition != nil {
-			reply(f.addition)
-			return
+		out := f.addition
+		if out == nil {
+			out = map[string]any{"text": "Wakeshift: this conversation is woken by Monitor.", "trailer": testTrailer, "meta": map[string]any{"wakeshift/connector": "tok", "other": "x"}}
 		}
-		reply(map[string]any{"text": "Wakeshift: this conversation is woken by Monitor.", "trailer": testTrailer, "meta": map[string]any{"wakeshift/connector": "tok", "other": "x"}})
+		if kinds, _ := call["client_requests"].([]any); f.request != nil && slices.Contains(kinds, any("elicit.form")) {
+			out = maps.Clone(out)
+			out["requests"] = []any{f.request}
+		}
+		reply(out)
+	case "/requests/outcome":
+		reply(map[string]any{"recorded": true})
 	case "/event-subscriptions/unsubscribe":
 		// addition: what unsubscribe_events adds (the core sends a wrapped
 		// tool's only when the call passed no key: f.unsubscribe).
@@ -573,7 +611,7 @@ func TestResolveSessionNamesNothing(t *testing.T) {
 }
 
 // Without a user, only the session_key finds the conversation: a
-// harness's conversation ID alone (Channel3's unwatch_product, a tool that
+// harness's conversation ID alone (a price tracker's unwatch_product, a tool that
 // subscribes to nothing, called by Codex with only its thread in _meta)
 // returns "", with no request.
 func TestResolveSessionWithoutUserNeedsTheKey(t *testing.T) {
@@ -935,6 +973,11 @@ func TestEventsNative(t *testing.T) {
 		{"a client that declares MCP Events", "some-client/1", map[string]any{"io.modelcontextprotocol/clientCapabilities": map[string]any{
 			"extensions": map[string]any{"io.modelcontextprotocol/events": map[string]any{}}}}, ""},
 		{"ChatGPT's client name", "x/1", map[string]any{"io.modelcontextprotocol/clientInfo": map[string]any{"name": "openai-mcp", "version": "1"}}, ""},
+		// A Work chat on the web: ChatGPT's tools/call client name, with the
+		// web's capabilities.
+		{"a Work chat on the web", "openai-mcp/1.0.0 (Codex)", map[string]any{"openai/session": "chat-w", "traceparent": "00-x",
+			"io.modelcontextprotocol/clientInfo":         map[string]any{"name": "openai-mcp (Codex)", "version": "1.0.0"},
+			"io.modelcontextprotocol/clientCapabilities": chatgptCaps(webCapsJSON)}, "chat-w"},
 	}
 	for _, c := range cases {
 		w.core.reset()
@@ -987,6 +1030,28 @@ func TestEventsNative(t *testing.T) {
 		if len(seen) != 1 || seen[0].Native {
 			t.Fatalf("Claude Code, %s: %+v", name, seen)
 		}
+	}
+	// ChatGPT's desktop app (Codex mode) isn't native: the same client name
+	// and User-Agent as a Work chat, and openai/session, but the desktop
+	// app's capabilities, as observed.
+	desktop := map[string]any{"openai/session": "chat-d", "sessionId": "s-1", "windowId": "s-1:0",
+		"io.modelcontextprotocol/clientInfo":         map[string]any{"name": "openai-mcp (Codex)", "version": "1.0.0"},
+		"io.modelcontextprotocol/clientCapabilities": chatgptCaps(desktopCapsJSON)}
+	seen = nil
+	w.callTool(t, "ada", "openai-mcp/1.0.0 (Codex)", "join", map[string]any{"table": "oak"}, desktop)
+	if len(seen) != 1 || seen[0].Native || seen[0].NativeConversation != "" {
+		t.Fatalf("ChatGPT's desktop app: %+v", seen)
+	}
+	// Nor is its regular chat (not Codex mode): the classic client, with
+	// openai/userAgent "Codex Desktop/…", as observed. It can't subscribe natively, and has no shell.
+	regular := map[string]any{"openai/session": "chat-r", "openai/userAgent": "Codex Desktop/26.1103.60933 (Mac OS; arm64)",
+		"openai/locale": "en-US", "openai/organization": "org", "openai/subject": "sub", "openai/userLocation": map[string]any{}, "timezone": "UTC", "timezone_offset_minutes": 0,
+		"io.modelcontextprotocol/clientInfo":         map[string]any{"name": "openai-mcp", "version": "1.0.0"},
+		"io.modelcontextprotocol/clientCapabilities": chatgptCaps(desktopChatCapsJSON)}
+	seen = nil
+	w.callTool(t, "ada", "openai-mcp/1.0.0", "join", map[string]any{"table": "oak"}, regular)
+	if len(seen) != 1 || seen[0].Native || seen[0].NativeConversation != "" {
+		t.Fatalf("ChatGPT's desktop app, a regular chat: %+v", seen)
 	}
 	// Unsubscribing natively ends the user's webhook subscription with those arguments only.
 	w.core.reset()
@@ -1648,4 +1713,20 @@ func TestEventsInputRequiredIsNotFinal(t *testing.T) {
 	if un := w.core.bodies("/event-subscriptions/unsubscribe"); un[0]["reason"] != "rolled_back" {
 		t.Fatalf("unsubscribe: %v", un[0])
 	}
+}
+
+// The capabilities ChatGPT's desktop app and a Work chat on the web sent
+// on tools/call, as observed.
+const (
+	desktopCapsJSON     = `{"experimental":{"openai/visibility":{"enabled":true}},"elicitation":{"form":{},"url":{}},"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app","text/html+skybridge"]},"openai/elicitation":{"form":{},"userVerification":{}},"openai/form":{}}}`
+	desktopChatCapsJSON = `{"experimental":{"openai/visibility":{"enabled":true}},"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]}}}`
+	webCapsJSON         = `{"experimental":{"openai/visibility":{"enabled":true}},"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]},"openai/elicitation":{"userVerification":{}}}}`
+)
+
+func chatgptCaps(s string) map[string]any {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		panic(err)
+	}
+	return m
 }

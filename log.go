@@ -1,10 +1,11 @@
 package wakeshift
 
-// What the SDK logs (design §2.11): every line has a code, from one list
+// What the SDK logs: every line has a code, from one list
 // shared by the three SDKs (warnings.json), at a fixed level, with the
 // code's fix in its message. Misuse logs once per client; failures that
 // can repeat (identify_error, user_required, authorize_failed, key_refused,
-// rollback_failed) log at most once per 5 minutes per code, with a count.
+// rollback_failed, block_failed, core_unavailable) log at most once per 5
+// minutes per code, with a count.
 // Never logged: keys, session keys, the caller's tokens and headers,
 // signing secrets, publish URL tokens, stream links, task IDs, payloads,
 // tool arguments, request bodies, query strings, and the vendor's error
@@ -51,7 +52,17 @@ var logCodes = map[string]logCode{
 	"watch_timeout":          {slog.LevelInfo, "Raise the watch's timeout if the work can take longer."},
 	"handler_missing":        {slog.LevelWarn, "Wrap your HTTP handler with attached.Handler."},
 	"key_refused":            {slog.LevelError, "Check WAKESHIFT_KEY: the key was revoked, or belongs to another console."},
+	"manifest_refused":       {slog.LevelError, "Fix the event definitions the message names; until then Wakeshift serves none of this app's events (no push, vouchers or subscribes)."},
 	"block_failed":           {slog.LevelWarn, "Nothing to change; the tool's result went out as the tool gave it, without Wakeshift's addition."},
+	"push_upstream_failed":   {slog.LevelWarn, "Nothing to change if it's rare: the client reconnects with its cursor. Check that this server can reach Wakeshift."},
+	"push_max_stream":        {slog.LevelDebug, "Set AttachOptions.Push.MaxStream to change it."},
+	"push_recheck_failed":    {slog.LevelWarn, "Check identify and authorize: while they fail, an open stream goes on until its last successful check is 15 minutes old (three checks, if longer)."},
+	"push_open_check_failed": {slog.LevelWarn, "Check identify and authorize: the client retries, and its stream opens once they answer."},
+	"push_recheck_stale":     {slog.LevelWarn, "Check identify and authorize: the client reconnects with its cursor, and retries while they fail."},
+	"core_unavailable":       {slog.LevelWarn, "Nothing to change; tool calls go on without Wakeshift (no wakes, results unchanged) until it answers again."},
+	// Client requests (clientrequests.go): this SDK's and the TypeScript SDK's, not in warnings.json yet.
+	"client_request_refused":       {slog.LevelWarn, "Nothing to change; check for a newer SDK if it keeps happening."},
+	"client_request_report_failed": {slog.LevelWarn, "Nothing to change; the result went out, and Wakeshift may ask again in a later call."},
 }
 
 // logWindow is how often a rate-limited code logs at most.

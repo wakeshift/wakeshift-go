@@ -1,6 +1,6 @@
 package wakeshift
 
-// Emitting (design §2.6), publish URLs (§2.7) and reading who's subscribed.
+// Emitting, publish URLs and reading who's subscribed.
 // Their options are sealed interfaces, so the compiler checks which call
 // takes which: To, ToSubscription and ToNative are a RecipientOption, which
 // every one takes; WithID only Emit; SigningSecret only CreatePublishURL.

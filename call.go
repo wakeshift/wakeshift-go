@@ -53,6 +53,13 @@ type wireCall struct {
 	// request's Mcp-Session-Id, when it has one: an anonymous subscribe
 	// voucher is bound to it.
 	TransportSession string `json:"transport_session,omitempty"`
+	// EventsExt: the request declares the MCP Events extension (its _meta's
+	// capabilities, or its session's initialize), sent only to a core that
+	// serves push, which decides whether opencode gets the native line.
+	EventsExt bool `json:"events_ext,omitempty"`
+	// ClientRequests are the kinds of client request the call can run
+	// (clientrequests.go), sent only on /calls/addition.
+	ClientRequests []string `json:"client_requests,omitempty"`
 }
 
 // requestOf is a go-sdk tool call's request as the wrapper reads it, from
@@ -75,6 +82,26 @@ func requestOf(req *mcp.CallToolRequest) adapt.Request {
 	if req.Extra != nil {
 		r.Header = req.Extra.Header
 		r.Token = req.Extra.TokenInfo
+	}
+	return r
+}
+
+// listRequestOf is a go-sdk tools/list request in adapt's form, as
+// requestOf has a call's: the client's name and capabilities from its
+// _meta (protocol 2026-07-28), else its session's initialize.
+func listRequestOf(req *mcp.ListToolsRequest) adapt.Request {
+	var r adapt.Request
+	if info := req.ClientInfo(); info != nil {
+		r.Client = info.Name
+	}
+	if caps := req.ClientCapabilities(); caps != nil {
+		r.Extensions = caps.Extensions
+	}
+	if req.Params != nil {
+		r.Meta = req.Params.GetMeta()
+	}
+	if req.Extra != nil {
+		r.Header = req.Extra.Header
 	}
 	return r
 }

@@ -43,6 +43,11 @@ type Side interface {
 	// HiddenBuiltins is the built-in tools tools/list leaves out (listed:
 	// the names it lists), by name.
 	HiddenBuiltins(at any, listed []string) map[string]bool
+	// ListsNative reports whether a tools/list comes from a client that
+	// subscribes with MCP Events itself (its request's _meta, else its
+	// session's initialize: r.Client, r.Extensions), so subscribe_events
+	// is left out.
+	ListsNative(ctx context.Context, at any, r Request) bool
 	// Subscribes reports whether the tool named name subscribes (it's
 	// declared, and not left unwrapped).
 	Subscribes(at any, name string) bool
@@ -150,12 +155,16 @@ func (a Annotations) Wire() map[string]any {
 }
 
 // Block is what Wakeshift adds to a wrapped tool's result: Text as a block
-// after the tool's own content, Trailer (a beacon line) last, and Meta in
-// the result's _meta.
+// after the tool's own content (before it, with Placement "before"),
+// Trailer (a beacon line) last, and Meta in the result's _meta.
 type Block struct {
 	Text    string
 	Trailer string
 	Meta    map[string]any
+	// Placement is where Text goes: "before" the tool's own content, or
+	// after it ("" or "after"). Only a client request's outcome sets it,
+	// and only on go-sdk, the one library that runs client requests.
+	Placement string
 }
 
 // BeaconLinePrefix starts the line a text-carried beacon is on (the core's

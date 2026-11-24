@@ -1,6 +1,6 @@
 package wakeshift
 
-// Who is behind a request (design §2.8): Identify, run lazily at most once
+// Who is behind a request: Identify, run lazily at most once
 // per request (the POST, with Handler), with a 10-second limit. A failure
 // refuses Wakeshift's part of the request, never anonymously.
 

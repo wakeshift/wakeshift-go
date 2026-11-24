@@ -63,6 +63,7 @@ type errorsGolden struct {
 	} `json:"unreachable"`
 	RPC []struct {
 		Name  string `json:"name"`
+		Mode  string `json:"mode"`
 		Error *struct {
 			Code    Code   `json:"code"`
 			Message string `json:"message"`
@@ -217,7 +218,7 @@ func TestRPCErrorsGolden(t *testing.T) {
 			err = &APIError{Status: 400, Code: c.Error.Code, Message: c.Error.Message, Reason: c.Error.Reason}
 		}
 		for _, dialect := range []string{event.DialectDraft, event.DialectChatGPT} {
-			code, msg, data := rpcErrorOf(err, event.CodesFor(dialect), "")
+			code, msg, data := rpcErrorOf(err, event.CodesFor(dialect), "", c.Mode)
 			got, _ := data.(map[string]string)
 			if code != c.Want.Code[dialect] || msg != c.Want.Message || !reflect.DeepEqual(got, c.Want.Data) {
 				t.Errorf("%s (%s): %d %q %v, want %d %q %v", c.Name, dialect, code, msg, data, c.Want.Code[dialect], c.Want.Message, c.Want.Data)
@@ -282,5 +283,14 @@ func TestErrorCodesGolden(t *testing.T) {
 	}
 	if !IsCode(fmt.Errorf("wrapped: %w", &APIError{Code: CodeIDReused}), CodeIDReused) {
 		t.Error("IsCode didn't see through wrapping")
+	}
+}
+
+// APIError stays comparable, as it was through v0.10.1: a vendor's code that
+// compares two values must still compile (this doesn't, if it isn't).
+func TestAPIErrorStaysComparable(t *testing.T) {
+	a, b := APIError{Code: "x"}, APIError{Code: "x"}
+	if a != b {
+		t.Fatal("equal APIErrors compare unequal")
 	}
 }

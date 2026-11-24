@@ -1068,7 +1068,7 @@ func TestToolMiddlewareNeverSeesSessionKey(t *testing.T) {
 // with a public one present.
 // The events capability is advertised with any event, tools-only ones
 // included: a native client subscribes to those with the subscribe voucher
-// a tool handed it (docs/subscribe-vouchers.md §4.3).
+// a tool handed it.
 func TestEventsCapabilityWithAnyEvent(t *testing.T) {
 	for _, open := range []bool{false, true} {
 		app, err := wakeshift.New(wakeshift.WithKey(testKey), wakeshift.WithCore("https://core.example"), wakeshift.WithMaxRetries(0))

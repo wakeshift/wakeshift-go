@@ -150,7 +150,7 @@ func Attach(wake *wakeshift.Client, srv *server.MCPServer, opts wakeshift.Attach
 		}
 	})
 	// tools/list: each tool that subscribes, as Wakeshift gives it.
-	hooks.AddAfterListTools(func(ctx context.Context, _ any, _ *mcp.ListToolsRequest, res *mcp.ListToolsResult) {
+	hooks.AddAfterListTools(func(ctx context.Context, _ any, req *mcp.ListToolsRequest, res *mcp.ListToolsResult) {
 		if res == nil {
 			return
 		}
@@ -158,7 +158,17 @@ func Attach(wake *wakeshift.Client, srv *server.MCPServer, opts wakeshift.Attach
 		for i, t := range res.Tools {
 			names[i] = t.Name
 		}
-		if hide := side.HiddenBuiltins(at, names); len(hide) > 0 {
+		hide := side.HiddenBuiltins(at, names)
+		if req != nil && side.ListsNative(ctx, at, listRequestOf(ctx, req)) {
+			// A client that subscribes itself, by its _meta or its session's
+			// initialize (a legacy-protocol session's only place to
+			// declare): no subscribe_events.
+			if hide == nil {
+				hide = map[string]bool{}
+			}
+			hide["subscribe_events"] = true
+		}
+		if len(hide) > 0 {
 			res.Tools = slices.DeleteFunc(res.Tools, func(t mcp.Tool) bool { return hide[t.Name] && isBuiltin[t.Name] })
 		}
 		for i := range res.Tools {
@@ -346,6 +356,37 @@ func requestOf(ctx context.Context, req mcp.CallToolRequest) adapt.Request {
 		}
 		if m.ProgressToken != nil {
 			r.Meta["progressToken"] = m.ProgressToken
+		}
+		if info := m.ClientInfo(); info != nil {
+			r.Client = info.Name
+		}
+		if caps := m.ClientCapabilities(); caps != nil {
+			r.Extensions = caps.Extensions
+		}
+	}
+	if s, ok := server.ClientSessionFromContext(ctx).(server.SessionWithClientInfo); ok {
+		if r.Client == "" {
+			r.Client = s.GetClientInfo().Name
+		}
+		if r.Extensions == nil {
+			r.Extensions = s.GetClientCapabilities().Extensions
+		}
+	}
+	return r
+}
+
+// listRequestOf is an mcp-go tools/list request in adapt's form, as
+// requestOf has a call's: the client's name and capabilities from its
+// _meta, else its session's initialize.
+func listRequestOf(ctx context.Context, req *mcp.ListToolsRequest) adapt.Request {
+	r := adapt.Request{Header: req.Header}
+	if len(r.Header) == 0 {
+		r.Header = nil
+	}
+	if m := req.Params.Meta; m != nil {
+		r.Meta = map[string]any{}
+		for k, v := range m.AdditionalFields {
+			r.Meta[k] = v
 		}
 		if info := m.ClientInfo(); info != nil {
 			r.Client = info.Name

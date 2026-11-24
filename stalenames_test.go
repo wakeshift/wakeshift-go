@@ -9,9 +9,8 @@ import (
 	"testing"
 )
 
-// removedNames are the names the redesign deleted (design, "What we're
-// removing" and the Go "Deleted" list), as a doc comment would mention
-// them. Plain words that are still prose ("notifies", "MCP Events") are
+// removedNames are the names the SDK's redesign deleted, as a doc comment
+// would mention them. Plain words that are still prose ("notifies", "MCP Events") are
 // left out; only the identifiers are matched.
 var removedNames = regexp.MustCompile(`\b(` + strings.Join([]string{
 	`WakeArgs`, `WakeInput`, `WakeOutput`, `WakeArgsJSONSchema`,

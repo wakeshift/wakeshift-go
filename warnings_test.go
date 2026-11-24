@@ -104,7 +104,7 @@ func TestWarningsGolden(t *testing.T) {
 	}
 }
 
-// quickstart is design §"The end state" on one client and server, called
+// quickstart is the SDK's quickstart on one client and server, called
 // by Claude Code: tools/list, a call of start_crawl, an emit.
 func quickstart(t *testing.T, logs *logLines, key string, identify bool) {
 	t.Helper()
@@ -292,6 +292,23 @@ var warningOps = map[string]func(t *testing.T, logs *logLines){
 				t.Fatalf("watch: %+v", res)
 			}
 			now = now.Add(10 * time.Second)
+		}
+	},
+	"core_unavailable": func(t *testing.T, logs *logLines) {
+		w := newWrapped(t, wakeshift.AttachOptions{}, wakeshift.WithLogger(logs.logger()))
+		w.core.fail = map[string]bool{"/event-subscriptions": true}
+		wakeshift.AddTool(w.at, &mcp.Tool{Name: "watch"}, func(ctx context.Context, call *wakeshift.ToolCall, in tableIn) (*mcp.CallToolResult, any, error) {
+			w.shared.Subscribe(ctx, call, tableArgs{Table: in.Table}) // handled: the tool goes on without wakes
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Watching."}}}, nil, nil
+		}, wakeshift.Subscribes(w.shared))
+		for i := range 7 {
+			res := w.callTool(t, "ada", "", "watch", map[string]any{"table": fmt.Sprintf("t%d", i)}, nil)
+			if res.IsError || strings.Join(res.texts(), "|") != "Watching." {
+				t.Fatalf("watch: %+v", res)
+			}
+		}
+		if n := len(w.core.bodies("/event-subscriptions")); n != 5 {
+			t.Errorf("%d subscribes sent, want 5 (the sixth and seventh skipped)", n)
 		}
 	},
 	"authorize_throws": func(t *testing.T, logs *logLines) {
@@ -514,6 +531,23 @@ var warningOps = map[string]func(t *testing.T, logs *logLines){
 		chat, _ := wakeshift.DefineEvent(wake, "chat.message", wakeshift.EventDef[tableArgs, turnMsg]{Description: "A message", Public: true})
 		for range 3 {
 			if _, err := chat.Emit(context.Background(), tableArgs{Table: "oak"}, turnMsg{}); !wakeshift.IsCode(err, wakeshift.CodeUnauthenticated) {
+				t.Errorf("emit: %v", err)
+			}
+		}
+	},
+	"manifest_refused": func(t *testing.T, logs *logLines) {
+		core := newPathCore()
+		core.answer("/manifest/merge", func(w http.ResponseWriter, _ map[string]any) {
+			w.WriteHeader(400)
+			io.WriteString(w, `{"error": {"code": "bad_request", "message": "events \"a\" and \"b\": topics can make the same topic"}}`)
+		})
+		cs := httptest.NewServer(core)
+		t.Cleanup(cs.Close)
+		wake := testClient(t, cs.URL, wakeshift.WithLogger(logs.logger()))
+		chat, _ := wakeshift.DefineEvent(wake, "chat.message", wakeshift.EventDef[tableArgs, turnMsg]{Description: "A message", Public: true})
+		wake.Attach(mcp.NewServer(&mcp.Implementation{Name: "t", Version: "1"}, nil), wakeshift.AttachOptions{})
+		for range 3 {
+			if _, err := chat.Emit(context.Background(), tableArgs{Table: "oak"}, turnMsg{}); !wakeshift.IsCode(err, "bad_request") {
 				t.Errorf("emit: %v", err)
 			}
 		}

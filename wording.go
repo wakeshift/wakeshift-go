@@ -3,10 +3,10 @@ package wakeshift
 // Everything the SDK says to an agent in tools/list and in its built-in
 // tools' results, the same in the three SDKs (event-tools.json).
 //
-// tools/list is compact (design §2.12): short argument descriptions, each
+// tools/list is compact: short argument descriptions, each
 // argument only on the tools that read it, short built-in descriptions and
-// minimal output schemas. The compact strings, which the compact tools/list
-// bench held to, live here, in compactStrings, and nowhere else.
+// minimal output schemas. The compact strings live here, in
+// compactStrings, and nowhere else.
 
 import (
 	"strings"
@@ -14,7 +14,7 @@ import (
 	"unicode/utf8"
 )
 
-// compactStrings are the compact tools/list strings (the bench's).
+// compactStrings are the compact tools/list strings.
 var compactStrings = struct {
 	SessionKey             string
 	Harness                string
@@ -25,7 +25,7 @@ var compactStrings = struct {
 	SubscribeDescription   string
 	UnsubscribeDescription string
 	ListDescription        string
-	// The subscribes sentence, which the bench kept as it was.
+	// The subscribes sentence, kept at its full length.
 	Notifies                string
 	NotifiesEvent           string
 	NotifiesEvents          string
@@ -95,7 +95,7 @@ var eventTools = map[string]string{
 	"list_failed":               "Couldn't list your subscriptions: {detail}",
 	"native_unknown_event":      "this app offers no event named {event}",
 	"native_tools_only":         "{event} can be subscribed only through this app's tools, or with the voucher one of them handed you",
-	"native_tools_only_poll":    "{event} can't be polled: it's subscribed to only through this app's tools, with a webhook",
+	"native_tools_only_poll":    "{event} can't be polled: it's subscribed to only through this app's tools, with a webhook or by push",
 	"native_bad_voucher":        "this voucher can't subscribe to {event}: it was used, it expired, or it's for other arguments",
 	"voucher_argument":          "The voucher from {app}'s tool result. Only its tools hand them out.",
 	"native_no_user":            "this app couldn't tell who you are, so it can't hold a subscription for you: sign in to it first",

@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/wakeshift/wakeshift-go/internal/adapt"
 	"github.com/wakeshift/wakeshift-go/internal/mcpevents/event"
@@ -17,7 +18,7 @@ import (
 
 func init() {
 	adapt.NewToolCall = func(s adapt.StandIn) any {
-		st := &standIn{record: s.Record, session: s.Session, mint: s.Mint, fail: s.Fail}
+		st := &standIn{record: s.Record, session: s.Session, mint: s.Mint, fail: s.Fail, noWakes: s.NoWakes, limit: s.CallLimit}
 		st.client, _ = s.Client.(*Client)
 		if st.session == "" {
 			st.session = "wsc_test_session"
@@ -95,7 +96,28 @@ type standIn struct {
 	session string
 	mu      sync.Mutex
 	n       int
-	created []standInSub // what Finish runs OnSubscribe for
+	created []standInSub    // what Finish runs OnSubscribe for
+	live    map[string]bool // what the call subscribed and still holds, for Wakes
+	noWakes bool
+	failed  bool // a Subscribe of the call failed: Wakes is false
+	// limit is the CallLimit the stand-in was made with; callLimit, what
+	// CallLimit says: limit once a Subscribe made or renewed a subscription.
+	limit, callLimit time.Duration
+}
+
+// limitNow is CallLimit on a stand-in call.
+func (st *standIn) limitNow() time.Duration {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.callLimit
+}
+
+// wakesNow is Wakes on a stand-in call: a subscription it made, or a
+// native line it offered, is still live, unless NoWakes.
+func (st *standIn) wakesNow() bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return !st.noWakes && !st.failed && len(st.live) > 0
 }
 
 // standInSub is a subscription a stand-in call created.
@@ -130,6 +152,12 @@ func (st *standIn) subscribe(ctx context.Context, app *Client, call *ToolCall, t
 				st.client.vouchers.remember(v, o.context, st.client.now())
 			}
 		}
+		st.mu.Lock()
+		if st.live == nil {
+			st.live = map[string]bool{}
+		}
+		st.live[subKey(t.name, args)] = true
+		st.mu.Unlock()
 		return Subscription{State: SubscriptionNative, User: call.User}, nil
 	}
 	st.mu.Lock()
@@ -143,6 +171,11 @@ func (st *standIn) subscribe(ctx context.Context, app *Client, call *ToolCall, t
 	case !existed:
 		st.created = append(st.created, standInSub{app: app, t: t, args: args, ctx: context.WithoutCancel(ctx), value: o.context})
 	}
+	if st.live == nil {
+		st.live = map[string]bool{}
+	}
+	st.live[key] = true
+	st.callLimit = st.limit
 	st.mu.Unlock()
 	call.setSession(st.session)
 	call.Recognized = &Recognized{}
@@ -164,6 +197,7 @@ func (st *standIn) unsubscribe(t *eventType, args json.RawMessage) (bool, error)
 	st.mu.Lock()
 	key := subKey(t.name, args)
 	st.created = slices.DeleteFunc(st.created, func(c standInSub) bool { return subKey(c.t.name, c.args) == key })
+	delete(st.live, key)
 	st.mu.Unlock()
 	return st.record != nil && st.record(op), nil
 }

@@ -133,7 +133,7 @@ func TestSessionKeyRedacts(t *testing.T) {
 	}
 }
 
-// The canary leak test (design §4, SEC H5): a full attach-and-call
+// The canary leak test (SEC H5): a full attach-and-call
 // scenario with a canary caller token (as Authorization: Bearer and in the
 // verified token), a canary session key, and the test key. Nothing the SDK
 // logs, returns or errors with, and no public type printed with any of

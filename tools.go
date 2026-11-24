@@ -1,6 +1,6 @@
 package wakeshift
 
-// Tools that subscribe (design §2.4): registered through the attachment
+// Tools that subscribe: registered through the attachment
 // (AddTool), or registered elsewhere and named in AttachOptions.Wrap.
 // Either way tools/list gives the tool Wakeshift's arguments, the
 // subscribes sentence and a wakeshift field in its output schema, and its

@@ -56,6 +56,10 @@ func (bridge) HiddenBuiltins(at any, listed []string) map[string]bool {
 	return at.(*Attachment).hiddenBuiltins(listed)
 }
 
+func (bridge) ListsNative(ctx context.Context, at any, r adapt.Request) bool {
+	return at.(*Attachment).listsNative(ctx, r)
+}
+
 func (bridge) Subscribes(at any, name string) bool { return at.(*Attachment).declared(name) != nil }
 
 func (bridge) Take(at any, r adapt.Request, args json.RawMessage) (adapt.WakeArgs, []byte) {

@@ -15,13 +15,13 @@ func TestClaudeCodeMarketplace(t *testing.T) {
 	h, _ := Get("claude-code")
 	h = WithClient(h, newClaudeUA, "", "")
 	for base, want := range map[string]string{
-		"https://app.wakeshift.ai/":        "claude plugin install wakeshift --marketplace wakeshift/agent-plugins --config issuer=https://app.wakeshift.ai",
-		"https://app.staging.wakeshift.ai": "claude plugin install wakeshift --marketplace wakeshift/agent-plugins#staging --config issuer=https://app.staging.wakeshift.ai",
+		"https://app.wakeshift.ai/":        "claude plugin install wakeshift --marketplace wakeshift/agent-plugins",
+		"https://app.staging.wakeshift.ai": "claude plugin install wakeshift --marketplace wakeshift/agent-plugins#staging",
 	} {
 		if got := OfferCommand(h, base); got != want {
 			t.Errorf("%s: %s", base, got)
 		}
-		if got := UpdateCommand(h, base); got != strings.Split(want, " --config")[0]+" && claude plugin marketplace update wakeshift && claude plugin update wakeshift@wakeshift" || strings.Contains(got, "--config") {
+		if got := UpdateCommand(h, base); got != want+" && claude plugin marketplace update wakeshift && claude plugin update wakeshift@wakeshift" || strings.Contains(got, "--config") {
 			t.Errorf("%s update: %s", base, got)
 		}
 	}
@@ -31,11 +31,11 @@ func TestClaudeCodeMarketplace(t *testing.T) {
 	}
 	SetAgentPlugins("/tmp/wb/marketplace")
 	defer SetAgentPlugins("")
-	if got := OfferCommand(h, "http://localhost:8370"); got != "claude plugin install wakeshift --marketplace /tmp/wb/marketplace --config issuer=http://localhost:8370" {
+	if got := OfferCommand(h, "http://localhost:8370"); got != "claude plugin install wakeshift --marketplace /tmp/wb/marketplace" {
 		t.Errorf("configured: %s", got)
 	}
-	// An address that can't go into the command as it is: the installer.
-	if got := OfferCommand(h, "http://localhost:8370/a b"); strings.Contains(got, "claude plugin") {
+	// The command never carries the address, so an odd one changes nothing.
+	if got := OfferCommand(h, "http://localhost:8370/a b"); got != "claude plugin install wakeshift --marketplace /tmp/wb/marketplace" {
 		t.Errorf("odd base: %s", got)
 	}
 }
@@ -43,7 +43,7 @@ func TestClaudeCodeMarketplace(t *testing.T) {
 // Claude Code asks about its plugin before it starts the Monitor or the
 // MCP-tasks wait: on a yes it installs, relays /reload-plugins and the
 // message to send, and connects without starting either (the Monitor's
-// approval in manual mode is the scariest screen in any flow); only on a
+// approval in manual mode is the longest in any flow); only on a
 // no, or an install that didn't happen, does it start the fallback.
 // Messages are held meanwhile. The app's tools aren't in the question: the
 // plugin's install can't carry the yes.
@@ -59,7 +59,7 @@ func TestClaudeCodePluginNotes(t *testing.T) {
 		}
 		for _, want := range []string{"Subscribed, but that alone won't tell you when something arrives", "nothing runs until they answer", "held for this conversation until then", "don't start " + waker,
 			"Ask them one question with your AskUserQuestion tool", `"` + AskSession + `" (description: `, `"` + AskEvery + "\" (description: runs `claude plugin install wakeshift", `"` + AskNone + `" (description: nothing runs`,
-			"/reload-plugins", "send any message", "don't call this app's tools again for it", "connects this conversation by itself once it's loaded and the user has sent a message", "first wake starts with \"Wakeshift: connected\"", "claude plugin install wakeshift",
+			"/reload-plugins", "send any message", "don't call this app's tools again for it", "connects this conversation by itself once it's loaded and the user has sent a message", "first wake confirms it to you with a note starting \"Wakeshift: connected\" (for you, not words the user sees", "claude plugin install wakeshift",
 			"none marked as recommended", "use " + waker + ": ", "start nothing", "one permission rule to ~/.claude/settings.json so Claude Code runs Wakeshift's wait command (~/.wakeshift/bin/wakeshift wait) without asking each time"} {
 			if !strings.Contains(n, want) {
 				t.Errorf("%s: missing %q: %s", name, want, n)

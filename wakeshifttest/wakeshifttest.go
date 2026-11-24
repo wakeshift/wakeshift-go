@@ -33,6 +33,7 @@ package wakeshifttest
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -101,13 +102,19 @@ type PublishURL struct {
 type Option func(*options)
 
 type options struct {
-	app  string
-	opts []wakeshift.Option
+	app     string
+	opts    []wakeshift.Option
+	noWakes bool
 }
 
 // App is the app's name the fake Wakeshift gives (default "Test app"):
 // the name tools/list's subscribes sentence uses.
 func App(name string) Option { return func(o *options) { o.app = name } }
+
+// NoWakes makes the fake Wakeshift answer that it can't wake the
+// conversations its Subscribes name (wakes false), so ToolCall.Wakes stays
+// false: for testing a tool's fallback, as without Wakeshift.
+func NoWakes() Option { return func(o *options) { o.noWakes = true } }
 
 // With passes client options through to wakeshift.New (WithLogger, for
 // one). WithKey, WithCore and WithHTTPClient are the fake's own.
@@ -132,7 +139,8 @@ func NewClient(opts ...Option) *Client {
 	for _, f := range opts {
 		f(&o)
 	}
-	f := &fake{app: o.app, ids: map[string]string{}, toolsOnly: map[string]bool{}, vouchers: map[string]*voucher{}, fail: map[string]string{}}
+	f := &fake{app: o.app, noWakes: o.noWakes, ids: map[string]string{}, toolsOnly: map[string]bool{}, vouchers: map[string]*voucher{}, fail: map[string]string{},
+		pushSubs: map[string]*pushSub{}}
 	all := append(slices.Clone(o.opts), wakeshift.WithKey(appkey.Format(testSeed[:])), wakeshift.WithCore("https://wakeshift.test"),
 		wakeshift.WithHTTPClient(&http.Client{Transport: f}), wakeshift.WithMaxRetries(0))
 	c, err := wakeshift.New(all...)
@@ -275,6 +283,15 @@ type ToolCallOptions struct {
 	// which Client.Redeem redeems, OnSubscribe getting the Subscribe's
 	// Context, as a ChatGPT conversation's would.
 	Client *Client
+	// NoWakes: Wakeshift can't wake the conversation, so call.Wakes()
+	// stays false after a Subscribe, for testing a tool's fallback.
+	// Otherwise Wakes is true while a Subscribe of the call holds.
+	NoWakes bool
+	// CallLimit is the agent program's per-call limit a Subscribe sets
+	// (call.CallLimit()), as Wakeshift gives it for Claude Code (60
+	// seconds) or Codex (300); 0, the default, when not known. A Native
+	// call never has one.
+	CallLimit time.Duration
 }
 
 // Recorder is what a stand-in call was asked.
@@ -342,8 +359,10 @@ func (r *Recorder) Unsubscribes() []Unsubscribe {
 // a unit test: event.Subscribe on it returns SubscriptionCreated (then
 // SubscriptionRenewed for the same event and arguments, or
 // SubscriptionNative for a Native call) and records it, Unsubscribe
-// records and reports whether the call had subscribed, and ResolveSession
-// returns its session. It works with any client's events.
+// records and reports whether the call had subscribed, ResolveSession
+// returns its session, and Wakes is true while a subscription the call made
+// (or, for a Native call, a line it offered) holds, never with NoWakes. It
+// works with any client's events.
 func NewToolCall(opts ToolCallOptions) (*wakeshift.ToolCall, *Recorder) {
 	rec := &Recorder{live: map[string]bool{}, fail: map[bool]string{}}
 	var events []any
@@ -357,7 +376,7 @@ func NewToolCall(opts ToolCallOptions) (*wakeshift.ToolCall, *Recorder) {
 	if tool == "" {
 		tool = "test_tool"
 	}
-	in := adapt.StandIn{Tool: tool, User: opts.User, Session: opts.Session, Native: opts.Native, Events: events,
+	in := adapt.StandIn{Tool: tool, User: opts.User, Session: opts.Session, Native: opts.Native, Events: events, NoWakes: opts.NoWakes, CallLimit: opts.CallLimit,
 		Fail: func(op adapt.StandInOp) error {
 			rec.mu.Lock()
 			defer rec.mu.Unlock()
@@ -424,7 +443,8 @@ func objectOf(raw []byte) map[string]any {
 
 // fake is Wakeshift, in memory: just enough of the app API for the SDK.
 type fake struct {
-	app string
+	app     string
+	noWakes bool // NoWakes: /event-subscriptions answers wakes false
 
 	mu           sync.Mutex
 	n            int
@@ -438,7 +458,9 @@ type fake struct {
 	toolsOnly    map[string]bool     // the manifest's tools-only events
 	vouchers     map[string]*voucher // by token
 	handedOut    []Voucher
-	fail         map[string]string // path → FailNext's failure, once
+	fail         map[string]string   // path → FailNext's failure, once
+	pushSubs     map[string]*pushSub // by ID
+	streams      []*pushStream
 }
 
 // voucher is one the fake handed out.
@@ -504,6 +526,9 @@ func (f *fake) RoundTrip(r *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 401, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(bytes.NewReader(b)),
 			Request: r, ContentLength: int64(len(b))}, nil
 	}
+	if path == "/events/stream" {
+		return f.stream(r, body), nil
+	}
 	status, out := f.serve(r.Method, path, body)
 	b, _ := json.Marshal(out)
 	return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(bytes.NewReader(b)),
@@ -557,7 +582,8 @@ func (f *fake) serve(method, path string, in map[string]json.RawMessage) (int, a
 		for _, e := range events {
 			f.toolsOnly[e.Name] = e.Subscribe == "tools"
 		}
-		return 200, map[string]any{"changed": []any{}, "features": []string{"subscribe_vouchers"}}
+		// It hands out subscribe vouchers and serves push, as Wakeshift does.
+		return 200, map[string]any{"changed": []any{}, "features": []string{"subscribe_vouchers", "push"}}
 	case path == "/events/emit":
 		event, args := str(in["name"]), canonical(in["arguments"])
 		id := str(in["id"])
@@ -574,6 +600,10 @@ func (f *fake) serve(method, path string, in map[string]json.RawMessage) (int, a
 		var to any
 		json.Unmarshal(in["to"], &to)
 		f.emits = append(f.emits, Emit{Event: event, Args: objectOf(in["arguments"]), Payload: objectOf(in["payload"]), Text: str(in["text"]), ID: id, To: to})
+		// The push streams it matches get it once f.mu is released.
+		defer f.deliverLocked(event, args, recipients(in["to"]), map[string]any{"name": event,
+			"timestamp": time.Now().UTC().Format(time.RFC3339), "data": json.RawMessage(cmp.Or(string(in["payload"]), "{}")),
+			"_meta": map[string]any{"ai.wakeshift/text": str(in["text"])}})()
 		return 200, map[string]any{"matched": f.matched(event, args, in["to"]), "duplicate": false, "unmatched": []any{}, "ended": []any{}}
 	case path == "/event-subscriptions":
 		c := callOf(in["call"])
@@ -598,7 +628,7 @@ func (f *fake) serve(method, path string, in map[string]json.RawMessage) (int, a
 			Once: once, Replay: seconds(replay), TTL: seconds(ttl), Reason: str(in["reason"]), Created: created})
 		return 200, map[string]any{"event_subscription": map[string]any{"id": f.live[i].id, "user": c.User, "event": event,
 			"arguments": json.RawMessage(args), "created": created}, "session": session, "agent": agent, "pending": "pa_test",
-			"addition": map[string]any{"text": "Wakeshift (test): this conversation is subscribed."}}
+			"wakes": !f.noWakes, "addition": map[string]any{"text": "Wakeshift (test): this conversation is subscribed."}}
 	case path == "/event-subscriptions/unsubscribe":
 		c := callOf(in["call"])
 		event, args := str(in["name"]), canonical(in["arguments"])
@@ -690,6 +720,8 @@ func (f *fake) serve(method, path string, in map[string]json.RawMessage) (int, a
 		}
 		return 200, map[string]any{"id": f.next("sub_test_"), "refresh_before": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
 			"cursor": "c0", "truncated": false, "created": created}
+	case path == "/events/stream/end":
+		return f.endStream(in)
 	case path == "/events/unsubscribe":
 		return 200, map[string]any{"ended": true}
 	case path == "/users/forget":
@@ -724,8 +756,8 @@ func (f *fake) redeem(in map[string]json.RawMessage) (int, any) {
 		"truncated": false, "created": created, "via": "tool:" + v.tool, "tool": v.tool}
 }
 
-// matched counts the live subscriptions an emit reaches.
-func (f *fake) matched(event, args string, to json.RawMessage) int {
+// recipients is the users an emit's to names (none: the arguments decide).
+func recipients(to json.RawMessage) []string {
 	var users []string
 	var one string
 	if json.Unmarshal(to, &one) == nil && one != "" {
@@ -746,6 +778,12 @@ func (f *fake) matched(event, args string, to json.RawMessage) int {
 			}
 		}
 	}
+	return users
+}
+
+// matched counts the live subscriptions an emit reaches.
+func (f *fake) matched(event, args string, to json.RawMessage) int {
+	users := recipients(to)
 	n := 0
 	for _, s := range f.live {
 		if s.event == event && (len(users) > 0 && slices.Contains(users, s.user) || len(users) == 0 && s.args == args) {

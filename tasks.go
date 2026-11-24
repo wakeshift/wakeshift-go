@@ -1,7 +1,6 @@
 package wakeshift
 
-// MCP Tasks as a wake path (docs/harnesses.md, "Claude Code: MCP tasks as a
-// wake path"): for a client that takes MCP tasks, on protocol 2026-07-28,
+// MCP Tasks as a wake path: for a client that takes MCP tasks, on protocol 2026-07-28,
 // the attachment serves Wakeshift's wait tool, wakeshift_wait, if the app
 // turns it on (AttachOptions.BuiltinTools.Wait; off by default). Its call
 // is answered with a task that completes when the conversation's next

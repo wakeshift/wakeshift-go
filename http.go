@@ -126,8 +126,7 @@ func (c *Client) noAnswer(ctx context.Context, client *http.Client, err error) e
 	}
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
-		return &APIError{Code: CodeTimeout, err: err,
-			Message: fmt.Sprintf("Wakeshift at %s didn't answer in time. %s %s", c.core, fixes[CodeTimeout], anchor(CodeTimeout))}
+		return c.timedOut(err)
 	}
 	cause := err
 	var ue *url.Error
@@ -136,6 +135,12 @@ func (c *Client) noAnswer(ctx context.Context, client *http.Client, err error) e
 	}
 	return &APIError{Code: CodeUnreachable, err: err,
 		Message: fmt.Sprintf("can't reach Wakeshift at %s (%s). %s %s", c.core, cause, fixes[CodeUnreachable], anchor(CodeUnreachable))}
+}
+
+// timedOut is the timeout error for a request that got no answer in time.
+func (c *Client) timedOut(err error) *APIError {
+	return &APIError{Code: CodeTimeout, err: err,
+		Message: fmt.Sprintf("Wakeshift at %s didn't answer in time. %s %s", c.core, fixes[CodeTimeout], anchor(CodeTimeout))}
 }
 
 // errorOf is the APIError for an answer with status that isn't a success:
@@ -156,7 +161,11 @@ func errorOf(status int, body []byte) *APIError {
 	if msg == "" {
 		msg = http.StatusText(status)
 	}
-	return &APIError{Status: status, Code: Code(str("code")), Message: msg, Reason: str("reason"), RequestID: str("request_id")}
+	var hint *errorHint
+	if h, ok := fields["hint"].(map[string]any); ok { // what the client can do instead, where the core says
+		hint = &errorHint{data: h}
+	}
+	return &APIError{Status: status, Code: Code(str("code")), Message: msg, Reason: str("reason"), RequestID: str("request_id"), hint: hint}
 }
 
 // Wakeshift runs behind Google's load balancer on Cloud Run. For some
@@ -177,12 +186,13 @@ func retryPause(attempt int) time.Duration {
 // the load balancer refused before it reached Wakeshift (Google's HTML 500
 // page, for any request; a 502, 503 or 504 not from Wakeshift for a GET or
 // HEAD) and one whose connection failed (not a timeout: its outcome is
-// unknown). Wakeshift's own errors (JSON) are never retried. Before a
-// retry it drops the SDK's own client's idle connections, never an app's.
+// unknown). Wakeshift's own errors (JSON) are never retried, nor is a
+// request a tool call waits on (inCall). Before a retry it drops the SDK's
+// own client's idle connections, never an app's.
 func (c *Client) do(client *http.Client, req *http.Request) (*http.Response, error) {
 	for attempt := 0; ; attempt++ {
 		resp, err := client.Do(req)
-		if attempt >= c.maxRetries || req.Context().Err() != nil {
+		if attempt >= c.maxRetries || req.Context().Err() != nil || noRetries(req.Context()) {
 			return resp, err
 		}
 		if err != nil {

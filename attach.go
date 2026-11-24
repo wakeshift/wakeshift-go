@@ -1,6 +1,6 @@
 package wakeshift
 
-// Attaching Wakeshift to an MCP server (design §2.3). Attach wraps the
+// Attaching Wakeshift to an MCP server. Attach wraps the
 // server at the protocol layer, never a vendor callback: at the HTTP layer
 // (Handler: the wake arguments stripped before the MCP library parses the
 // body, events/*, the wait tool, the POST as the unit of identity) and in
@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,10 +60,26 @@ type AttachOptions struct {
 	WrapFunc func(tool string) []ToolOption
 	// BuiltinTools picks Wakeshift's own tools.
 	BuiltinTools BuiltinTools
-	// IsNativeClient, for house agents only, says that a caller the SDK
-	// can't recognize subscribes to events itself (MCP Events). False
+	// IsNativeClient, for first-party agents the app runs itself, says
+	// that a caller the SDK can't recognize subscribes to events itself
+	// (MCP Events). False
 	// leaves it to the SDK's own checks.
 	IsNativeClient func(ctx context.Context, r Request) bool
+	// Push is MCP Events push (events/stream), served over HTTP where
+	// Wakeshift offers it: PushOff turns it off; MaxStream and MaxHeartbeat
+	// fit it to the host. On stdio it isn't served (clients poll).
+	Push PushOptions
+	// DisableClientRequests turns client requests off: results keep
+	// Wakeshift's usual text. With them on (the default), Wakeshift may
+	// describe, during a subscribing call, one request for the SDK to make
+	// of the MCP client: an elicitation form (Codex's install offer, in its
+	// own dialog), which the SDK runs only within fixed bounds, and only
+	// where the transport carries a request to the client during the call
+	// (stdio, or streamable HTTP with sessions). Turn them off for a server
+	// behind something that won't hold an SSE response for up to two
+	// minutes, or that can't route the client's answer back to the process
+	// holding the call.
+	DisableClientRequests bool
 }
 
 // BuiltinTools picks Wakeshift's own tools. The zero value is the default:
@@ -98,6 +115,9 @@ type settings struct {
 	isNative    func(context.Context, Request) bool
 	wait        bool
 	builtins    map[string]bool
+	push        PushOptions
+	// noRequests: AttachOptions.DisableClientRequests.
+	noRequests bool
 	// eventsKept: the server declares MCP Events itself, so Wakeshift serves
 	// none (events_capability_kept).
 	eventsKept atomic.Bool
@@ -105,7 +125,8 @@ type settings struct {
 
 func (c *Client) settingsOf(opts AttachOptions) *settings {
 	return &settings{app: c, identify: opts.Identify, requireUser: opts.RequireUser, isNative: opts.IsNativeClient,
-		wait: opts.BuiltinTools.Wait && !opts.BuiltinTools.DisableAll, builtins: opts.BuiltinTools.enabled()}
+		wait: opts.BuiltinTools.Wait && !opts.BuiltinTools.DisableAll, builtins: opts.BuiltinTools.enabled(), push: c.pushOptionsOf(opts.Push),
+		noRequests: opts.DisableClientRequests}
 }
 
 // Attachment is Wakeshift attached to one MCP server (Attach).
@@ -231,6 +252,13 @@ func (at *Attachment) middleware(next mcp.MethodHandler) mcp.MethodHandler {
 				lr, _ := req.(*mcp.ListToolsRequest)
 				complete := list.NextCursor == "" && (lr == nil || lr.Params == nil || lr.Params.Cursor == "")
 				at.amendList(ctx, list, complete)
+				if lr != nil && at.listsNative(ctx, listRequestOf(lr)) {
+					// A client that subscribes itself, by its _meta or its
+					// session's initialize (a legacy-protocol session's only
+					// place to declare): no subscribe_events.
+					ours := at.builtinTools[subscribeEventsTool]
+					list.Tools = slices.DeleteFunc(list.Tools, func(t *mcp.Tool) bool { return t != nil && t == ours })
+				}
 			}
 			return res, err
 		case "tools/call":
